@@ -1496,6 +1496,347 @@ html, body, #root {
   border-top: 2px solid var(--border-thick);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   NPC BIO CARD  —  fixed top-left overlay, visible when NPC is selected
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.npc-bio-card {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 200;
+  width: 260px;
+  background: #0a0a0a;
+  border: 2px solid var(--accent);
+  border-radius: 6px;
+  box-shadow: 0 0 16px rgba(224, 255, 0, 0.18), 0 4px 24px rgba(0, 0, 0, 0.7);
+  overflow: hidden;
+  pointer-events: auto;
+}
+
+.npc-bio-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px 8px;
+  border-bottom: 2px solid var(--border-thick);
+  gap: 8px;
+}
+
+.npc-bio-name {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.npc-bio-body {
+  padding: 10px 12px 12px;
+}
+
+.npc-bio-backstory {
+  font-family: var(--sans);
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--text);
+  margin: 0 0 8px;
+  opacity: 0.85;
+}
+
+.npc-bio-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.npc-bio-tag {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--accent);
+  background: var(--accent-dim);
+  border: 1px solid rgba(224, 255, 0, 0.3);
+  border-radius: 3px;
+  padding: 2px 6px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   NPC VOICE WIDGET  —  "Talk to NPC" button inside the bio card
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.npc-voice-widget {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.npc-talk-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border: 2px solid var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  cursor: pointer;
+  border-radius: 3px;
+  white-space: nowrap;
+  transition: background 0.15s, box-shadow 0.15s;
+}
+
+.npc-talk-btn:hover {
+  background: rgba(224, 255, 0, 0.2);
+  box-shadow: 0 0 8px rgba(224, 255, 0, 0.3);
+}
+
+@keyframes npc-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(224, 255, 0, 0.5); }
+  50%       { box-shadow: 0 0 0 6px rgba(224, 255, 0, 0); }
+}
+
+.npc-talk-btn.listening {
+  animation: npc-pulse 1.4s ease-in-out infinite;
+  border-color: var(--accent);
+  background: rgba(224, 255, 0, 0.15);
+}
+
+.npc-talk-btn.responding {
+  animation: npc-pulse 0.8s ease-in-out infinite;
+  border-color: var(--green);
+  color: var(--green);
+  background: rgba(64, 255, 96, 0.1);
+}
+
+.npc-talk-btn.error {
+  border-color: var(--red);
+  color: var(--red);
+  background: rgba(255, 64, 64, 0.1);
+  animation: none;
+}
+
+.npc-talk-icon {
+  font-size: 10px;
+  line-height: 1;
+}
+
+.npc-talk-error {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--red);
+  max-width: 200px;
+  text-align: right;
+  line-height: 1.4;
+  cursor: pointer;
+  opacity: 0.9;
+}
+
+.npc-talk-error:hover {
+  opacity: 1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   NPC VOICE CONFIG PANEL  —  dockable panel (matches MeshGen / Composer style)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.npcconfig-panel {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.npcconfig-section {
+  border-bottom: 2px solid var(--border-thick);
+  padding: 12px;
+  flex-shrink: 0;
+}
+
+.npcconfig-section-title {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+}
+
+.npcconfig-hint {
+  color: var(--text-muted);
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.npcconfig-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.npcconfig-field:last-child {
+  margin-bottom: 0;
+}
+
+.npcconfig-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+}
+
+.npcconfig-optional {
+  color: var(--text-muted);
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.npcconfig-input {
+  width: 100%;
+  background: var(--bg-input);
+  border: 2px solid var(--border-thin);
+  color: var(--text);
+  padding: 6px 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.npcconfig-input:focus {
+  border-color: var(--accent);
+}
+
+.npcconfig-input::placeholder {
+  color: var(--text-muted);
+}
+
+.npcconfig-select {
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%236a6a6a'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  padding-right: 26px;
+}
+
+.npcconfig-select:focus {
+  border-color: var(--accent);
+}
+
+.npcconfig-readonly {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text);
+  background: var(--bg-surface);
+  border: 2px solid var(--border-thin);
+  padding: 6px 8px;
+  opacity: 0.7;
+  user-select: text;
+}
+
+.npcconfig-prompt {
+  width: 100%;
+  background: var(--bg-input);
+  border: 2px solid var(--border-thin);
+  color: var(--text);
+  padding: 8px;
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.6;
+  resize: vertical;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.npcconfig-prompt:focus {
+  border-color: var(--accent);
+}
+
+.npcconfig-empty {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 4px 0;
+  line-height: 1.5;
+}
+
+.npcconfig-talk-section {
+  flex-grow: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  padding: 20px 12px;
+  min-height: 100px;
+}
+
+/* Scale up the talk button when rendered inside the config panel */
+.npcconfig-talk-section .npc-talk-btn {
+  padding: 12px 28px;
+  font-size: 11px;
+  letter-spacing: 1.5px;
+}
+
+.npcconfig-talk-section .npc-voice-widget {
+  align-items: center;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MESH GEN PANEL — NPC concept additions
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.meshgen-concept-input {
+  width: 100%;
+  background: var(--bg-input);
+  border: 2px solid var(--border-thin);
+  color: var(--text);
+  padding: 6px 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.meshgen-concept-input:focus {
+  border-color: var(--accent);
+}
+
+.meshgen-concept-input::placeholder {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.meshgen-npc-status {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--accent);
+  letter-spacing: 0.5px;
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }

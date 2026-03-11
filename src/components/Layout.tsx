@@ -8,6 +8,8 @@ import AnimationsPanel from './panels/AnimationsPanel';
 import MeshGenPanel from './panels/MeshGenPanel';
 import EnhancePanel from './panels/EnhancePanel';
 import SceneComposerPanel from './panels/SceneComposerPanel';
+import NpcVoiceConfigPanel from './panels/NpcVoiceConfigPanel';
+import NpcBioCard from './NpcBioCard';
 
 const layoutJson: IJsonModel = {
   global: {
@@ -59,6 +61,7 @@ const layoutJson: IJsonModel = {
             weight: 25,
             children: [
               { type: 'tab', name: 'Animation Gen', component: 'animations' },
+              { type: 'tab', name: 'NPC Voice Config', component: 'npcVoiceConfig' },
             ],
           },
         ],
@@ -94,6 +97,8 @@ export default function EditorLayout() {
         return <EnhancePanel />;
       case 'composer':
         return <SceneComposerPanel />;
+      case 'npcVoiceConfig':
+        return <NpcVoiceConfigPanel />;
       default:
         return null;
     }
@@ -102,6 +107,7 @@ export default function EditorLayout() {
   return (
     <div className="app-layout">
       <Layout model={modelRef.current} factory={factory} />
+      <NpcBioCard />
     </div>
   );
 }

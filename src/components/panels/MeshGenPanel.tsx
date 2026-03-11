@@ -5,6 +5,7 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { createImageTo3D, pollTask, type MeshyTask, type ModelType } from '../../engine/MeshyAPI';
 import { engineRef } from '../../engine/engineRef';
 import { useEditorStore } from '../../store/editorStore';
+import { generateNpcPersonality } from '../../engine/OpenAIAPI';
 
 type ViewSlot = 'front' | 'back' | 'left' | 'right' | 'top';
 const VIEW_LABELS: { key: ViewSlot; label: string }[] = [
@@ -61,6 +62,8 @@ export default function MeshGenPanel() {
   const [errorMsg, setErrorMsg] = useState('');
   const [resultTask, setResultTask] = useState<MeshyTask | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [characterConcept, setCharacterConcept] = useState('');
+  const [npcGenStatus, setNpcGenStatus] = useState<'idle' | 'generating' | 'done' | 'error'>('idle');
   const fileRef = useRef<HTMLInputElement>(null);
   const cancelRef = useRef<{ cancel: () => void } | null>(null);
 
@@ -241,6 +244,23 @@ export default function MeshGenPanel() {
           position: finalPos,
           scale: finalScale,
         });
+
+        // Generate NPC personality if a concept prompt was provided and an OpenAI key is set
+        const concept = characterConcept.trim();
+        const openAiKey = s.npcConfig.openAiKey;
+        if (concept && openAiKey) {
+          s.setGenerationPrompt(importedId, concept);
+          setNpcGenStatus('generating');
+          generateNpcPersonality(concept, openAiKey)
+            .then((personality) => {
+              useEditorStore.getState().setNpcPersonality(importedId, personality);
+              setNpcGenStatus('done');
+            })
+            .catch((err) => {
+              console.error('[NPC] Personality generation failed:', err);
+              setNpcGenStatus('error');
+            });
+        }
       }
     } catch (err) {
       console.error('Failed to add to scene:', err);
@@ -253,6 +273,7 @@ export default function MeshGenPanel() {
     setProgress(0);
     setResultTask(null);
     setErrorMsg('');
+    setNpcGenStatus('idle');
   }
 
   return (
@@ -303,6 +324,29 @@ export default function MeshGenPanel() {
             <div style={{ fontSize: 10, opacity: 0.4, marginTop: 4 }}>or click to browse</div>
           </div>
         )}
+      </div>
+
+      {/* Character concept for NPC personality */}
+      <div className="meshgen-options" style={{ borderTop: '2px solid var(--border-thick)', borderBottom: 'none', paddingBottom: 0 }}>
+        <div className="meshgen-option-row" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
+          <span className="meshgen-option-label">NPC Concept <span style={{ opacity: 0.5, fontWeight: 400, textTransform: 'none' }}>(optional)</span></span>
+          <input
+            type="text"
+            className="meshgen-concept-input"
+            placeholder={'e.g. "a medieval blacksmith"'}
+            value={characterConcept}
+            onChange={(e) => setCharacterConcept(e.target.value)}
+          />
+          {npcGenStatus === 'generating' && (
+            <span className="meshgen-npc-status">Generating NPC personality...</span>
+          )}
+          {npcGenStatus === 'done' && (
+            <span className="meshgen-npc-status" style={{ color: 'var(--green)' }}>NPC personality generated</span>
+          )}
+          {npcGenStatus === 'error' && (
+            <span className="meshgen-npc-status" style={{ color: 'var(--red)' }}>NPC generation failed (check OpenAI key)</span>
+          )}
+        </div>
       </div>
 
       {/* Options */}

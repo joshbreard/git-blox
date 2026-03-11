@@ -7,6 +7,8 @@ import type {
   Vec3,
   GeometryType,
   AnimationData,
+  NpcPersonality,
+  NpcConfig,
 } from './types';
 
 let nextId = 1;
@@ -58,6 +60,11 @@ export interface EditorState {
   setComposerError: (s: string | null) => void;
   setComposerRefImage: (s: string | null) => void;
 
+  npcConfig: NpcConfig;
+  setNpcConfig: (updates: Partial<NpcConfig>) => void;
+  setNpcPersonality: (objectId: string, personality: NpcPersonality | null) => void;
+  setGenerationPrompt: (objectId: string, prompt: string) => void;
+
   peekNextId: () => string;
   addObject: (type: GeometryType, position?: Vec3) => string;
   addImportedObject: (name: string, animations?: AnimationData[]) => string;
@@ -84,6 +91,36 @@ export interface EditorState {
   toggleFace: (index: number) => void;
   clearEditSelection: () => void;
 }
+
+// Prevent Vite HMR from hot-reloading this module — a hot reload creates a new
+// Zustand store instance while SceneManager keeps its subscription on the old
+// one, so objects appear in React but never reach Three.js.  A full page reload
+// ensures every module shares the same store singleton.
+if (import.meta.hot) {
+  import.meta.hot.decline();
+}
+
+// Remove any stale key written by a previous persist-middleware attempt.
+try { localStorage.removeItem('git-blox-editor'); } catch {}
+
+const NPC_CONFIG_KEY = 'git-blox-npc-config';
+
+function loadNpcConfig(): NpcConfig {
+  try {
+    const raw = localStorage.getItem(NPC_CONFIG_KEY);
+    if (raw) return { ...defaultNpcConfig, ...JSON.parse(raw) };
+  } catch {}
+  return defaultNpcConfig;
+}
+
+const defaultNpcConfig: NpcConfig = {
+  openAiKey: '',
+  deepgramKey: '',
+  elevenLabsKey: '',
+  elevenLabsVoiceId: '21m00Tcm4TlvDq8ikWAM',
+  nvidiaApiKey: '',
+  nvidiaFunctionId: '8efc55f5-6f00-424e-afe9-26212cd2c630',
+};
 
 export const useEditorStore = create<EditorState>((set, get) => ({
   objects: {},
@@ -114,6 +151,36 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   setComposerLoading: (b) => set({ composerLoading: b }),
   setComposerError: (s) => set({ composerError: s }),
   setComposerRefImage: (s) => set({ composerRefImage: s }),
+
+  npcConfig: loadNpcConfig(),
+  setNpcConfig: (updates) =>
+    set((s) => {
+      const next = { ...s.npcConfig, ...updates };
+      try { localStorage.setItem(NPC_CONFIG_KEY, JSON.stringify(next)); } catch {}
+      return { npcConfig: next };
+    }),
+
+  setNpcPersonality: (objectId, personality) =>
+    set((s) => {
+      if (!s.objects[objectId]) return s;
+      return {
+        objects: {
+          ...s.objects,
+          [objectId]: { ...s.objects[objectId], npcPersonality: personality },
+        },
+      };
+    }),
+
+  setGenerationPrompt: (objectId, prompt) =>
+    set((s) => {
+      if (!s.objects[objectId]) return s;
+      return {
+        objects: {
+          ...s.objects,
+          [objectId]: { ...s.objects[objectId], generationPrompt: prompt },
+        },
+      };
+    }),
 
   peekNextId: () => peekId(),
 
