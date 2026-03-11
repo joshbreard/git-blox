@@ -8,6 +8,7 @@ import { KeyboardManager } from '../../engine/KeyboardManager';
 import { engineRef } from '../../engine/engineRef';
 import { useEditorStore } from '../../store/editorStore';
 import type { ActiveTool } from '../../store/types';
+import NpcVoiceHudCard from '../NpcVoiceHudCard';
 
 const tools: { tool: ActiveTool; label: string; key: string }[] = [
   { tool: 'select', label: 'Sel', key: '' },
@@ -173,6 +174,9 @@ export default function SceneViewPanel() {
       <div ref={canvasRef} className="scene-canvas" />
       <SceneHUD />
       <SceneStatus />
+      <div className="scene-npc-hud">
+        <NpcVoiceHudCard />
+      </div>
     </div>
   );
 }

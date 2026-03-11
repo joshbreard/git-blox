@@ -52,6 +52,7 @@ export class SceneManager {
     const id = store.peekNextId();
     this.geometryCache.set(id, geometry);
     store.addImportedObject(name);
+    store.ensureNpcPersonality(id);
     return id;
   }
 
@@ -77,6 +78,7 @@ export class SceneManager {
       duration: parseFloat(c.duration.toFixed(2)),
     }));
     store.addImportedObject(name, animData);
+    store.ensureNpcPersonality(id);
     return id;
   }
 

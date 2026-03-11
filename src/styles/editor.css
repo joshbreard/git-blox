@@ -1784,6 +1784,27 @@ html, body, #root {
   line-height: 1.5;
 }
 
+.npcconfig-init-btn {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: rgba(224, 255, 0, 0.08);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 6px 14px;
+  cursor: pointer;
+  transition: background 0.15s;
+  font-style: normal;
+}
+
+.npcconfig-init-btn:hover {
+  background: rgba(224, 255, 0, 0.18);
+}
+
 .npcconfig-talk-section {
   flex-grow: 1;
   display: flex;
@@ -1804,6 +1825,78 @@ html, body, #root {
 .npcconfig-talk-section .npc-voice-widget {
   align-items: center;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   GLOBAL TALK BUTTON  —  fixed top-left, outside all panels
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.global-talk-button {
+  position: fixed;
+  top: 52px; /* below the bio card header row */
+  left: 12px;
+  z-index: 1000;
+  pointer-events: auto;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   NPC VOICE HUD CARD  —  top-right overlay anchored to Scene View
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.scene-npc-hud {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 20;
+  pointer-events: none;
+}
+
+.npc-voice-hud-card {
+  background: rgba(0, 0, 0, 0.82);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 8px 12px;
+  min-width: 140px;
+  max-width: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.npc-hud-name {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.npc-hud-persona {
+  font-family: var(--sans);
+  font-size: 9px;
+  color: var(--text-dim);
+  opacity: 0.75;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.npc-hud-status {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  margin-top: 2px;
+}
+
+.npc-hud-status--idle       { color: var(--text-dim); opacity: 0.5; }
+.npc-hud-status--connecting { color: var(--accent); opacity: 0.7; }
+.npc-hud-status--listening  { color: var(--accent); }
+.npc-hud-status--responding { color: var(--green); }
+.npc-hud-status--error      { color: var(--red); }
 
 /* ═══════════════════════════════════════════════════════════════════════════
    MESH GEN PANEL — NPC concept additions

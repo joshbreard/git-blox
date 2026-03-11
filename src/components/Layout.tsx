@@ -10,6 +10,8 @@ import EnhancePanel from './panels/EnhancePanel';
 import SceneComposerPanel from './panels/SceneComposerPanel';
 import NpcVoiceConfigPanel from './panels/NpcVoiceConfigPanel';
 import NpcBioCard from './NpcBioCard';
+import NpcVoiceWidget from './NpcVoiceWidget';
+import { useEditorStore } from '../store/editorStore';
 
 const layoutJson: IJsonModel = {
   global: {
@@ -78,6 +80,19 @@ const layoutJson: IJsonModel = {
   },
 };
 
+/** Single global "Talk to NPC" button — only rendered when an NPC with a personality is selected. */
+function GlobalTalkButton() {
+  const objects = useEditorStore((s) => s.objects);
+  const selectedIds = useEditorStore((s) => s.selectedIds);
+  const selectedObj = selectedIds.length > 0 ? objects[selectedIds[0]] : null;
+  if (!selectedObj?.npcPersonality) return null;
+  return (
+    <div className="global-talk-button">
+      <NpcVoiceWidget objectId={selectedObj.id} />
+    </div>
+  );
+}
+
 export default function EditorLayout() {
   const modelRef = useRef(Model.fromJson(layoutJson));
 
@@ -108,6 +123,7 @@ export default function EditorLayout() {
     <div className="app-layout">
       <Layout model={modelRef.current} factory={factory} />
       <NpcBioCard />
+      <GlobalTalkButton />
     </div>
   );
 }

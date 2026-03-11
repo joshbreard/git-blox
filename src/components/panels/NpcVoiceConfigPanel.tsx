@@ -1,12 +1,13 @@
 import { useEditorStore } from '../../store/editorStore';
 import { NVIDIA_A2F_MODELS } from '../../store/types';
-import NpcVoiceWidget from '../NpcVoiceWidget';
+import type { NpcPersonality } from '../../store/types';
 
 export default function NpcVoiceConfigPanel() {
   const config = useEditorStore((s) => s.npcConfig);
   const setNpcConfig = useEditorStore((s) => s.setNpcConfig);
   const objects = useEditorStore((s) => s.objects);
   const selectedIds = useEditorStore((s) => s.selectedIds);
+  const ensureNpcPersonality = useEditorStore((s) => s.ensureNpcPersonality);
   const selectedObj = selectedIds.length > 0 ? objects[selectedIds[0]] : null;
   const personality = selectedObj?.npcPersonality;
 
@@ -85,70 +86,90 @@ export default function NpcVoiceConfigPanel() {
 
       <div className="npcconfig-section">
         <div className="npcconfig-section-title">
-          NPC System Prompt
-          {selectedObj && !personality && (
-            <span className="npcconfig-hint"> — select a character with NPC personality</span>
-          )}
+          NPC Personality
           {!selectedObj && (
             <span className="npcconfig-hint"> — no character selected</span>
           )}
         </div>
         {personality ? (
-          <NpcSystemPromptEditor
+          <NpcPersonalityEditor
             objectId={selectedObj!.id}
             personality={personality}
           />
+        ) : selectedObj ? (
+          <div className="npcconfig-empty">
+            <p style={{ marginBottom: 10 }}>
+              This character has no NPC personality yet. Initialize one to enable voice conversations.
+            </p>
+            <button
+              className="npcconfig-init-btn"
+              onClick={() => ensureNpcPersonality(selectedObj.id)}
+            >
+              Initialize NPC Personality
+            </button>
+          </div>
         ) : (
           <div className="npcconfig-empty">
-            Generate a mesh with an NPC concept to auto-populate this field.
+            Select any character in the scene to configure its NPC personality. Works with both generated and imported meshes.
           </div>
         )}
       </div>
 
-      <div className="npcconfig-section npcconfig-talk-section">
-        <div className="npcconfig-section-title">Voice Session</div>
-        {selectedObj && personality ? (
-          <NpcVoiceWidget objectId={selectedObj.id} />
-        ) : (
-          <div className="npcconfig-empty">
-            Select an NPC to begin
-          </div>
-        )}
-      </div>
     </div>
   );
 }
 
-function NpcSystemPromptEditor({
+function NpcPersonalityEditor({
   objectId,
   personality,
 }: {
   objectId: string;
-  personality: NonNullable<ReturnType<typeof useEditorStore.getState>['objects'][string]['npcPersonality']>;
+  personality: NpcPersonality;
 }) {
   const setNpcPersonality = useEditorStore((s) => s.setNpcPersonality);
+  const update = (patch: Partial<NpcPersonality>) =>
+    setNpcPersonality(objectId, { ...personality, ...patch });
 
   return (
     <div>
       <div className="npcconfig-field">
         <label className="npcconfig-label">Character Name</label>
-        <div className="npcconfig-readonly">{personality.name}</div>
+        <input
+          type="text"
+          className="npcconfig-input"
+          value={personality.name}
+          onChange={(e) => update({ name: e.target.value })}
+        />
+      </div>
+      <div className="npcconfig-field">
+        <label className="npcconfig-label">Backstory / Bio</label>
+        <input
+          type="text"
+          className="npcconfig-input"
+          placeholder="Short description shown in the bio card"
+          value={personality.backstory}
+          onChange={(e) => update({ backstory: e.target.value })}
+        />
       </div>
       <div className="npcconfig-field">
         <label className="npcconfig-label">Speaking Style</label>
-        <div className="npcconfig-readonly">{personality.speakingStyle}</div>
+        <input
+          type="text"
+          className="npcconfig-input"
+          placeholder="e.g. formal, gruff, cheerful"
+          value={personality.speakingStyle}
+          onChange={(e) => update({ speakingStyle: e.target.value })}
+        />
       </div>
       <div className="npcconfig-field">
-        <label className="npcconfig-label" style={{ marginBottom: 4 }}>
+        <label className="npcconfig-label">
           System Prompt
-          <span className="npcconfig-optional"> (auto-generated — editable)</span>
+          <span className="npcconfig-optional"> (sent to LLM — editable)</span>
         </label>
         <textarea
           className="npcconfig-prompt"
           value={personality.systemPrompt}
-          onChange={(e) =>
-            setNpcPersonality(objectId, { ...personality, systemPrompt: e.target.value })
-          }
+          onChange={(e) => update({ systemPrompt: e.target.value })}
           rows={10}
         />
       </div>

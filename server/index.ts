@@ -270,6 +270,50 @@ wss.on('connection', (ws: WebSocket) => {
     }
   }
 
+  async function startConversation() {
+    if (!config || responding) return;
+    responding = true;
+
+    const openai = new OpenAI({ apiKey: config.openAiKey });
+    const system = config.personalityPrompt ?? 'You are a helpful NPC.';
+    const greetingPrompt = 'Start the conversation by greeting the player and asking them one short question. Speak in character.';
+
+    try {
+      let fullResponse = '';
+      const stream = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        stream: true,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: greetingPrompt },
+        ],
+      });
+
+      for await (const chunk of stream) {
+        const token = chunk.choices[0]?.delta?.content ?? '';
+        fullResponse += token;
+      }
+
+      console.log(`[startConversation] Greeting: "${fullResponse}"`);
+      send(ws, { type: 'response_start' });
+
+      for await (const chunk of streamElevenLabsTTS(
+        fullResponse,
+        config.voiceId,
+        config.elevenLabsKey,
+      )) {
+        sendBinary(ws, chunk);
+      }
+
+      send(ws, { type: 'response_end' });
+    } catch (err: unknown) {
+      console.error('[startConversation] Error:', err instanceof Error ? err.message : err);
+      send(ws, { type: 'error', message: err instanceof Error ? err.message : 'Greeting error' });
+    } finally {
+      responding = false;
+    }
+  }
+
   async function initDeepgram() {
     if (!config) return;
     const dg = new DeepgramClient({ apiKey: config.deepgramKey });
@@ -323,7 +367,7 @@ wss.on('connection', (ws: WebSocket) => {
       if (msg.is_final) {
         currentTranscript += (currentTranscript ? ' ' : '') + t;
       }
-      if (msg.speech_final && currentTranscript.trim()) {
+      if (msg.speech_final && currentTranscript.trim() && !responding) {
         const toSend = currentTranscript.trim();
         console.log(`[Deepgram] Transcript received: "${toSend}"`);
         currentTranscript = '';
@@ -358,6 +402,7 @@ wss.on('connection', (ws: WebSocket) => {
           .then(() => {
             send(ws, { type: 'ready' });
             console.log('[WS] Session initialized');
+            startConversation();
           })
           .catch((err: Error) => {
             send(ws, { type: 'error', message: `ASR init failed: ${err.message}` });

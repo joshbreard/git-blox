@@ -63,6 +63,10 @@ export interface EditorState {
   npcConfig: NpcConfig;
   setNpcConfig: (updates: Partial<NpcConfig>) => void;
   setNpcPersonality: (objectId: string, personality: NpcPersonality | null) => void;
+  /** Creates a default NpcPersonality for objectId if one does not already exist. */
+  ensureNpcPersonality: (objectId: string) => void;
+  npcVoiceStatus: 'idle' | 'connecting' | 'listening' | 'responding' | 'error';
+  setNpcVoiceStatus: (s: 'idle' | 'connecting' | 'listening' | 'responding' | 'error') => void;
   setGenerationPrompt: (objectId: string, prompt: string) => void;
 
   peekNextId: () => string;
@@ -159,6 +163,8 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       try { localStorage.setItem(NPC_CONFIG_KEY, JSON.stringify(next)); } catch {}
       return { npcConfig: next };
     }),
+  npcVoiceStatus: 'idle',
+  setNpcVoiceStatus: (s) => set({ npcVoiceStatus: s }),
 
   setNpcPersonality: (objectId, personality) =>
     set((s) => {
@@ -170,6 +176,26 @@ export const useEditorStore = create<EditorState>((set, get) => ({
         },
       };
     }),
+
+  ensureNpcPersonality: (objectId) => {
+    const s = get();
+    if (!s.objects[objectId] || s.objects[objectId].npcPersonality) return;
+    const obj = s.objects[objectId];
+    const personality: NpcPersonality = {
+      name: obj.name,
+      backstory: '',
+      speakingStyle: 'friendly and helpful',
+      accentDescription: '',
+      vocabularyQuirks: '',
+      systemPrompt: `You are ${obj.name}, a character in a 3D world. Stay in character and be engaging. Speak naturally and keep responses concise.`,
+    };
+    set((prev) => ({
+      objects: {
+        ...prev.objects,
+        [objectId]: { ...prev.objects[objectId], npcPersonality: personality },
+      },
+    }));
+  },
 
   setGenerationPrompt: (objectId, prompt) =>
     set((s) => {

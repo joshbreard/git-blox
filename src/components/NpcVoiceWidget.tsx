@@ -58,8 +58,9 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
   const objects = useEditorStore((s) => s.objects);
   const obj = objects[objectId];
   const personality = obj?.npcPersonality;
+  const status = useEditorStore((s) => s.npcVoiceStatus);
+  const setStatus = useEditorStore((s) => s.setNpcVoiceStatus);
 
-  const [status, setStatus] = useState<Status>('idle');
   const [errorMsg, setErrorMsg] = useState('');
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -67,6 +68,7 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const listeningRef = useRef<boolean>(false);
 
   // Audio playback scheduling
   const playbackTimeRef = useRef<number>(0); // AudioContext time when next chunk is scheduled
@@ -118,6 +120,8 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
     streamRef.current = null;
     wsRef.current?.close();
     wsRef.current = null;
+    listeningRef.current = false;
+    playbackTimeRef.current = 0;
     setStatus('idle');
 
     // Reset morph targets on the mesh
@@ -139,7 +143,7 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
       return;
     }
     if (!personality) {
-      setErrorMsg('No NPC personality found. Generate a mesh with an NPC concept first.');
+      setErrorMsg('No NPC personality configured. Select a character and set up its personality in the NPC Voice Config panel.');
       setStatus('error');
       return;
     }
@@ -208,14 +212,18 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
           const msg = JSON.parse(event.data as string) as { type: string; [k: string]: unknown };
           switch (msg.type) {
             case 'ready':
-              setStatus('listening');
+              // Server will speak first — stay in responding state until response_end
+              listeningRef.current = false;
+              setStatus('responding');
               break;
             case 'response_start':
+              listeningRef.current = false;
               setStatus('responding');
               blendshapeOffsetRef.current = audioCtxRef.current?.currentTime ?? 0;
               blendshapeQueueRef.current = [];
               break;
             case 'response_end':
+              listeningRef.current = true;
               setStatus('listening');
               break;
             case 'blendshapes':
@@ -233,17 +241,19 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
       };
 
       ws.onerror = () => {
+        listeningRef.current = false;
         setErrorMsg('Cannot connect to NPC voice server (ws://localhost:3001). Is it running?');
         setStatus('error');
       };
 
       ws.onclose = () => {
+        listeningRef.current = false;
         if (status !== 'idle') setStatus('idle');
       };
 
       // ── PCM streaming ─────────────────────────────────────────────────────
       processor.onaudioprocess = (e) => {
-        if (ws.readyState !== WebSocket.OPEN) return;
+        if (!listeningRef.current || ws.readyState !== WebSocket.OPEN) return;
         const float32 = e.inputBuffer.getChannelData(0);
         const int16 = new Int16Array(float32.length);
         for (let i = 0; i < float32.length; i++) {
