@@ -71,7 +71,7 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
   const listeningRef = useRef<boolean>(false);
 
   // Audio playback scheduling
-  const playbackTimeRef = useRef<number>(0); // AudioContext time when next chunk is scheduled
+  const nextStartTimeRef = useRef<number>(0); // AudioContext time when next chunk is scheduled
   const blendshapeQueueRef = useRef<BlendshapeFrame[]>([]);
   const blendshapeOffsetRef = useRef<number>(0); // AudioContext time when NPC started speaking
   const rafRef = useRef<number>(0);
@@ -121,7 +121,7 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
     wsRef.current?.close();
     wsRef.current = null;
     listeningRef.current = false;
-    playbackTimeRef.current = 0;
+    nextStartTimeRef.current = 0;
     setStatus('idle');
 
     // Reset morph targets on the mesh
@@ -201,9 +201,9 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
             const src = ctx.createBufferSource();
             src.buffer = decoded;
             src.connect(ctx.destination);
-            const startAt = Math.max(ctx.currentTime, playbackTimeRef.current);
+            const startAt = Math.max(ctx.currentTime, nextStartTimeRef.current);
             src.start(startAt);
-            playbackTimeRef.current = startAt + decoded.duration;
+            nextStartTimeRef.current = startAt + decoded.duration;
           }).catch(() => { /* non-fatal decode error */ });
           return;
         }
@@ -219,6 +219,7 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
             case 'response_start':
               listeningRef.current = false;
               setStatus('responding');
+              nextStartTimeRef.current = audioCtxRef.current?.currentTime ?? 0;
               blendshapeOffsetRef.current = audioCtxRef.current?.currentTime ?? 0;
               blendshapeQueueRef.current = [];
               break;

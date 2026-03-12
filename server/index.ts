@@ -58,6 +58,29 @@ function sendBinary(ws: WebSocket, buf: Buffer | Uint8Array) {
   if (ws.readyState === WebSocket.OPEN) ws.send(buf);
 }
 
+const CHUNK_THRESHOLD = 32768; // 32 KB minimum before forwarding to client
+
+/** Buffer TTS chunks and flush to the WebSocket in CHUNK_THRESHOLD-sized batches. */
+async function streamTTSToClient(
+  ws: WebSocket,
+  source: AsyncIterable<Buffer>,
+): Promise<number> {
+  let audioBuffer = Buffer.alloc(0);
+  let totalBytes = 0;
+  for await (const chunk of source) {
+    totalBytes += chunk.length;
+    audioBuffer = Buffer.concat([audioBuffer, chunk]);
+    if (audioBuffer.length >= CHUNK_THRESHOLD) {
+      sendBinary(ws, audioBuffer);
+      audioBuffer = Buffer.alloc(0);
+    }
+  }
+  if (audioBuffer.length > 0) {
+    sendBinary(ws, audioBuffer);
+  }
+  return totalBytes;
+}
+
 /**
  * Stream text to ElevenLabs websocket TTS.
  * Returns async generator of raw MP3 audio chunks.
@@ -67,6 +90,7 @@ async function* streamElevenLabsTTS(
   voiceId: string,
   apiKey: string,
 ): AsyncGenerator<Buffer> {
+  if (!voiceId) throw new Error('ElevenLabs voiceId is required but was not provided in session config');
   const url = `${ELEVENLABS_BASE}/v1/text-to-speech/${voiceId}/stream`;
   const res = await fetch(url, {
     method: 'POST',
@@ -194,13 +218,20 @@ wss.on('connection', (ws: WebSocket) => {
   let currentTranscript = '';
   const incomingAudioChunks: Buffer[] = [];
 
-  // Track whether we're currently generating a response (prevent overlapping)
-  let responding = false;
+  // Track whether we're currently speaking (LLM + TTS pipeline active)
+  let isSpeaking = false;
+  // Set synchronously before handleTranscript is called; prevents a second
+  // speech_final event from slipping through before isSpeaking is set inside handleTranscript.
+  let processingUtterance = false;
 
   async function handleTranscript(transcript: string) {
-    if (!config || responding || !transcript.trim()) return;
-    responding = true;
+    if (isSpeaking) return;
+    if (!config || !transcript.trim()) return;
+    isSpeaking = true;
     currentTranscript = '';
+    if (deepgramSocket && deepgramReady) {
+      try { (deepgramSocket as unknown as { finish(): void }).finish(); } catch { /* ignore */ }
+    }
 
     try {
       send(ws, { type: 'transcript', text: transcript });
@@ -234,17 +265,10 @@ wss.on('connection', (ws: WebSocket) => {
       // TTS: stream audio back to client
       console.log(`[ElevenLabs] Sending TTS for: "${fullResponse}"`);
       try {
-        let totalBytes = 0;
-        for await (const chunk of streamElevenLabsTTS(
-          fullResponse,
-          config.voiceId,
-          config.elevenLabsKey,
-        )) {
-          totalBytes += chunk.length;
-          console.log(`[ElevenLabs] Audio received, bytes: ${chunk.length} (total so far: ${totalBytes})`);
-          console.log('[WS] Sending audio chunk to client');
-          sendBinary(ws, chunk);
-        }
+        const totalBytes = await streamTTSToClient(
+          ws,
+          streamElevenLabsTTS(fullResponse, config.voiceId, config.elevenLabsKey),
+        );
         console.log(`[ElevenLabs] TTS complete, total bytes: ${totalBytes}`);
       } catch (err: unknown) {
         console.error('[ElevenLabs] Error calling TTS:', err instanceof Error ? err.stack ?? err.message : err);
@@ -266,13 +290,17 @@ wss.on('connection', (ws: WebSocket) => {
       console.error('[Session] Pipeline error:', err instanceof Error ? err.stack ?? err.message : err);
       send(ws, { type: 'error', message: err instanceof Error ? err.message : 'Response error' });
     } finally {
-      responding = false;
+      await reconnectDeepgram().catch((err) => console.error('[Deepgram] Reconnect failed:', err));
+      isSpeaking = false;
     }
   }
 
   async function startConversation() {
-    if (!config || responding) return;
-    responding = true;
+    if (!config || isSpeaking) return;
+    isSpeaking = true;
+    if (deepgramSocket && deepgramReady) {
+      try { (deepgramSocket as unknown as { finish(): void }).finish(); } catch { /* ignore */ }
+    }
 
     const openai = new OpenAI({ apiKey: config.openAiKey });
     const system = config.personalityPrompt ?? 'You are a helpful NPC.';
@@ -297,21 +325,28 @@ wss.on('connection', (ws: WebSocket) => {
       console.log(`[startConversation] Greeting: "${fullResponse}"`);
       send(ws, { type: 'response_start' });
 
-      for await (const chunk of streamElevenLabsTTS(
-        fullResponse,
-        config.voiceId,
-        config.elevenLabsKey,
-      )) {
-        sendBinary(ws, chunk);
-      }
+      await streamTTSToClient(
+        ws,
+        streamElevenLabsTTS(fullResponse, config.voiceId, config.elevenLabsKey),
+      );
 
       send(ws, { type: 'response_end' });
     } catch (err: unknown) {
       console.error('[startConversation] Error:', err instanceof Error ? err.message : err);
       send(ws, { type: 'error', message: err instanceof Error ? err.message : 'Greeting error' });
     } finally {
-      responding = false;
+      await reconnectDeepgram().catch((err) => console.error('[Deepgram] Reconnect failed:', err));
+      isSpeaking = false;
     }
+  }
+
+  async function reconnectDeepgram() {
+    if (deepgramSocket) {
+      try { (deepgramSocket as unknown as { finish(): void }).finish(); } catch { /* ignore */ }
+      deepgramSocket = null;
+      deepgramReady = false;
+    }
+    await initDeepgram();
   }
 
   async function initDeepgram() {
@@ -350,29 +385,41 @@ wss.on('connection', (ws: WebSocket) => {
     });
     socket.on('message', (msg) => {
       if (msg.type !== 'Results') return;
+      if (isSpeaking || processingUtterance) return;
+
       const alt = msg.channel?.alternatives?.[0];
-      if (!alt) {
-        console.log('[Deepgram] Message with no alternatives, skipping');
-        return;
-      }
+      if (!alt) return;
+
       const t = alt.transcript ?? '';
       const confidence = alt.confidence ?? 0;
       console.log(`[Deepgram] Result — is_final:${msg.is_final} speech_final:${msg.speech_final} confidence:${confidence.toFixed(3)} transcript:"${t}"`);
 
-      if (confidence < 0.5 && t.trim()) {
-        console.log(`[Deepgram] Low confidence (${confidence.toFixed(3)}) — skipping transcript: "${t}"`);
+      // Accumulate intermediate finals; only trigger on a fully-closed utterance.
+      if (!msg.is_final || !msg.speech_final) {
+        if (msg.is_final) {
+          currentTranscript += (currentTranscript ? ' ' : '') + t;
+        }
         return;
       }
 
-      if (msg.is_final) {
-        currentTranscript += (currentTranscript ? ' ' : '') + t;
-      }
-      if (msg.speech_final && currentTranscript.trim() && !responding) {
-        const toSend = currentTranscript.trim();
-        console.log(`[Deepgram] Transcript received: "${toSend}"`);
+      // Guard 1: both is_final and speech_final must be true (already enforced above).
+      // Guard 2: skip low-confidence results.
+      if (confidence < 0.5) {
+        console.log(`[Deepgram] Low confidence (${confidence.toFixed(3)}) — skipping`);
         currentTranscript = '';
-        handleTranscript(toSend);
+        return;
       }
+
+      // Guard 3: skip empty transcript.
+      const toSend = (currentTranscript + (currentTranscript ? ' ' : '') + t).trim();
+      currentTranscript = '';
+      if (!toSend) return;
+
+      // Guard 4: set processingUtterance synchronously before the async call so any
+      // duplicate speech_final events arriving before isSpeaking is set are dropped.
+      console.log(`[Deepgram] Transcript received: "${toSend}"`);
+      processingUtterance = true;
+      handleTranscript(toSend).finally(() => { processingUtterance = false; });
     });
   }
 
