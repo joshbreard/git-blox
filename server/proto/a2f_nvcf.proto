@@ -1,0 +1,23 @@
+/*
+ * NVCF cloud variant of the Audio2Face service definition.
+ *
+ * The self-hosted microservice proto (nvidia_ace.services.a2f.v1.proto) declares
+ * PushAudioStream as returning a single Status, because in the self-hosted
+ * architecture the A2F service pushes AnimationDataStream to a separate downstream
+ * animation controller rather than returning it to the caller.
+ *
+ * On the NVIDIA Cloud Functions (NVCF) deployment the NIM streams AnimationDataStream
+ * messages directly back to the caller on the same connection, so we override the
+ * return type here to match the actual wire behavior.
+ */
+syntax = "proto3";
+
+package nvidia_ace.services.a2f.v1;
+
+import "nvidia_ace.a2f.v1.proto";
+import "nvidia_ace.animation_data.v1.proto";
+
+service A2FService {
+  rpc PushAudioStream(stream nvidia_ace.a2f.v1.AudioStream)
+      returns (stream nvidia_ace.animation_data.v1.AnimationDataStream) {}
+}

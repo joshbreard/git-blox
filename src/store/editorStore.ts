@@ -10,6 +10,7 @@ import type {
   NpcPersonality,
   NpcConfig,
 } from './types';
+import { NVIDIA_A2F_MODELS } from './types';
 
 let nextId = 1;
 function generateId(): string {
@@ -112,7 +113,12 @@ const NPC_CONFIG_KEY = 'git-blox-npc-config';
 function loadNpcConfig(): NpcConfig {
   try {
     const raw = localStorage.getItem(NPC_CONFIG_KEY);
-    if (raw) return { ...defaultNpcConfig, ...JSON.parse(raw) };
+    if (raw) {
+      const stored = { ...defaultNpcConfig, ...JSON.parse(raw) };
+      // Always pin to the current canonical ID so stale localStorage values can't persist.
+      stored.nvidiaFunctionId = NVIDIA_A2F_MODELS[0].id;
+      return stored;
+    }
   } catch {}
   return defaultNpcConfig;
 }
@@ -123,7 +129,7 @@ const defaultNpcConfig: NpcConfig = {
   elevenLabsKey: '',
   elevenLabsVoiceId: '21m00Tcm4TlvDq8ikWAM',
   nvidiaApiKey: '',
-  nvidiaFunctionId: '8efc55f5-6f00-424e-afe9-26212cd2c630',
+  nvidiaFunctionId: NVIDIA_A2F_MODELS[0].id,
 };
 
 export const useEditorStore = create<EditorState>((set, get) => ({

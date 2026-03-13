@@ -16,8 +16,7 @@
  *   Server → Client:
  *     JSON:   { type:'transcript', text }
  *     JSON:   { type:'response_start' }
- *     Binary: audio bytes (MP3 chunks from ElevenLabs)
- *     JSON:   { type:'blendshapes', timestamp:number, values:Record<string,number> }
+ *     JSON:   { type:'npc_response', audio:string (base64 WAV), blendshapes:Array<{timestamp,values}>, fps:30 }
  *     JSON:   { type:'response_end' }
  *     JSON:   { type:'error', message }
  */
@@ -28,16 +27,17 @@ import { createServer } from 'http';
 import express from 'express';
 import cors from 'cors';
 import { DeepgramClient } from '@deepgram/sdk';
-import type { V1Socket } from '@deepgram/sdk/dist/cjs/api/resources/listen/resources/v1/client/Socket.js';
+import type { ListenLiveClient } from '@deepgram/sdk';
 import OpenAI from 'openai';
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import * as path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = Number(process.env.PORT ?? 3001);
 const ELEVENLABS_BASE = 'https://api.elevenlabs.io';
-
-/** Build the NVIDIA NIM REST endpoint URL for Audio2Face-3D given a function/model ID. */
-function nvidiaA2FUrl(functionId: string): string {
-  return `https://api.nvcf.nvidia.com/v2/nvcf/pexec/functions/${functionId}`;
-}
 
 // ─── Express HTTP (health-check only — main API lives in root server) ────────
 const app = express();
@@ -58,27 +58,20 @@ function sendBinary(ws: WebSocket, buf: Buffer | Uint8Array) {
   if (ws.readyState === WebSocket.OPEN) ws.send(buf);
 }
 
-const CHUNK_THRESHOLD = 32768; // 32 KB minimum before forwarding to client
-
-/** Buffer TTS chunks and flush to the WebSocket in CHUNK_THRESHOLD-sized batches. */
-async function streamTTSToClient(
-  ws: WebSocket,
+/** Buffer all TTS PCM chunks, wrap in a WAV header, and return both buffer and base64. */
+async function bufferTTSToWav(
   source: AsyncIterable<Buffer>,
-): Promise<number> {
-  let audioBuffer = Buffer.alloc(0);
+): Promise<{ wavBuffer: Buffer; base64: string; totalBytes: number }> {
+  const chunks: Buffer[] = [];
   let totalBytes = 0;
   for await (const chunk of source) {
+    chunks.push(chunk);
     totalBytes += chunk.length;
-    audioBuffer = Buffer.concat([audioBuffer, chunk]);
-    if (audioBuffer.length >= CHUNK_THRESHOLD) {
-      sendBinary(ws, audioBuffer);
-      audioBuffer = Buffer.alloc(0);
-    }
   }
-  if (audioBuffer.length > 0) {
-    sendBinary(ws, audioBuffer);
-  }
-  return totalBytes;
+  const pcm = Buffer.concat(chunks);
+  const wavBuffer = pcmToWav(pcm, 16000, 1, 16);
+  const base64 = wavBuffer.toString('base64');
+  return { wavBuffer, base64, totalBytes };
 }
 
 /**
@@ -101,7 +94,7 @@ async function* streamElevenLabsTTS(
     body: JSON.stringify({
       text,
       model_id: 'eleven_flash_v2_5',
-      output_format: 'mp3_44100_128',
+      output_format: 'pcm_16000',
     }),
   });
 
@@ -119,50 +112,128 @@ async function* streamElevenLabsTTS(
 }
 
 /**
- * Call NVIDIA Audio2Face-3D REST API with a complete audio buffer.
- * Returns ARKit blendshape frames: Array of { timestamp, values }
+ * Call NVIDIA Audio2Face-3D via gRPC on NVCF.
  *
- * Note: Requires NVIDIA API key and the NIM endpoint to be accessible.
- * Falls back gracefully (returns empty array) if unavailable.
+ * Loads proto/a2f_nvcf.proto (NVCF cloud variant where PushAudioStream returns a
+ * stream of AnimationDataStream rather than a single Status). Connects to
+ * grpc.nvcf.nvidia.com:443 with TLS, sets authorization + function-id metadata,
+ * then streams the WAV PCM in 4096-byte AudioWithEmotion chunks. Collects
+ * blendshape names from the AnimationDataStreamHeader and float values from each
+ * AnimationData frame, returning them as { timestamp, values } objects.
  */
 async function fetchA2FBlendshapes(
-  audioPcmBuffer: Buffer,
-  sampleRate: number,
+  audioBase64: string,
   nvidiaApiKey: string,
   nvidiaFunctionId: string,
 ): Promise<Array<{ timestamp: number; values: Record<string, number> }>> {
   if (!nvidiaApiKey || !nvidiaFunctionId) return [];
 
-  try {
-    // Build multipart form with WAV header + PCM data
-    const wavBuffer = pcmToWav(audioPcmBuffer, sampleRate, 1, 16);
+  console.log(`[A2F] WAV buffer byte length: ${Buffer.byteLength(audioBase64, 'base64')}`);
+  console.log(`[A2F] base64 preview (first 100 chars): ${audioBase64.slice(0, 100)}`);
+  console.log(`[A2F] functionId: ${nvidiaFunctionId}`);
 
-    const formData = new FormData();
-    formData.append(
-      'audio',
-      new Blob([wavBuffer], { type: 'audio/wav' }),
-      'speech.wav',
+  try {
+    const protoDir = path.resolve(__dirname, 'proto');
+    const packageDef = protoLoader.loadSync(
+      path.join(protoDir, 'a2f_nvcf.proto'),
+      {
+        keepCase: true,
+        longs: Number,
+        enums: Number,
+        defaults: true,
+        oneofs: true,
+        includeDirs: [protoDir],
+      },
     );
 
-    const res = await fetch(nvidiaA2FUrl(nvidiaFunctionId), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${nvidiaApiKey}`,
-      },
-      body: formData,
+    const grpcObj = grpc.loadPackageDefinition(packageDef) as Record<string, unknown>;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const A2FServiceClient = (((grpcObj.nvidia_ace as any).services.a2f.v1) as any).A2FService;
+
+    const meta = new grpc.Metadata();
+    meta.set('authorization', `Bearer ${nvidiaApiKey}`);
+    meta.set('function-id', nvidiaFunctionId);
+
+    const client = new A2FServiceClient(
+      'grpc.nvcf.nvidia.com:443',
+      grpc.credentials.createSsl(),
+    );
+
+    return new Promise((resolve) => {
+      const blendshapeNames: string[] = [];
+      const frames: Array<{ timestamp: number; values: Record<string, number> }> = [];
+
+      // Bidirectional stream: we send AudioStream messages, server sends AnimationDataStream.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const call = (client as any).pushAudioStream(meta);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      call.on('data', (msg: any) => {
+        // First response message: header containing blendshape names for the session.
+        if (msg.animation_data_stream_header) {
+          const names: string[] =
+            msg.animation_data_stream_header?.skel_animation_header?.blend_shapes ?? [];
+          blendshapeNames.push(...names);
+          console.log(`[A2F] Header received — ${blendshapeNames.length} blendshape names`);
+        }
+
+        // Subsequent messages: animation data with one or more blend_shape_weights frames.
+        if (msg.animation_data?.skel_animation) {
+          for (const bsw of msg.animation_data.skel_animation.blend_shape_weights ?? []) {
+            // bsw: FloatArrayWithTimeCode { time_code: number, values: number[] }
+            const frameValues: Record<string, number> = {};
+            (bsw.values as number[]).forEach((weight, i) => {
+              if (blendshapeNames[i] !== undefined) frameValues[blendshapeNames[i]] = weight;
+            });
+            frames.push({ timestamp: bsw.time_code as number, values: frameValues });
+          }
+        }
+
+        // Status message (typically the last one in the stream).
+        if (msg.status) {
+          console.log(`[A2F] Status — code: ${msg.status.code} message: ${msg.status.message}`);
+        }
+      });
+
+      call.on('end', () => {
+        console.log(`[A2F] Stream ended — ${frames.length} blendshape frames collected`);
+        resolve(frames);
+      });
+
+      call.on('error', (err: Error) => {
+        console.warn('[A2F] gRPC stream error:', err.message);
+        resolve([]);
+      });
+
+      // ── Send audio ───────────────────────────────────────────────────────────
+
+      // First message: AudioStreamHeader describing the PCM format.
+      call.write({
+        audio_stream_header: {
+          audio_header: {
+            audio_format: 0,      // AUDIO_FORMAT_PCM
+            channel_count: 1,
+            samples_per_second: 16000,
+            bits_per_sample: 16,
+          },
+        },
+      });
+
+      // Subsequent messages: raw PCM chunks (skip the 44-byte WAV header —
+      // the format is already described by audio_header above).
+      const wavBuf = Buffer.from(audioBase64, 'base64');
+      const WAV_HEADER_BYTES = 44;
+      const CHUNK_SIZE = 4096;
+      for (let offset = WAV_HEADER_BYTES; offset < wavBuf.length; offset += CHUNK_SIZE) {
+        call.write({
+          audio_with_emotion: {
+            audio_buffer: wavBuf.subarray(offset, offset + CHUNK_SIZE),
+          },
+        });
+      }
+
+      call.end();
     });
-
-    if (!res.ok) {
-      console.warn(`[A2F] Non-OK response ${res.status} — no blendshapes`);
-      return [];
-    }
-
-    const json = (await res.json()) as {
-      output?: Array<{ time_stamp: number; blend_shapes: Record<string, number> }>;
-    };
-
-    const frames = json.output ?? [];
-    return frames.map((f) => ({ timestamp: f.time_stamp, values: f.blend_shapes }));
   } catch (err) {
     console.warn('[A2F] Error fetching blendshapes:', err);
     return [];
@@ -212,7 +283,7 @@ interface SessionConfig {
 wss.on('connection', (ws: WebSocket) => {
   console.log('[WS] Client connected');
   let config: SessionConfig | null = null;
-  let deepgramSocket: V1Socket | null = null;
+  let deepgramSocket: ListenLiveClient | null = null;
   let deepgramReady = false;
   const pendingAudioBuffer: Buffer[] = [];
   let currentTranscript = '';
@@ -230,7 +301,7 @@ wss.on('connection', (ws: WebSocket) => {
     isSpeaking = true;
     currentTranscript = '';
     if (deepgramSocket && deepgramReady) {
-      try { (deepgramSocket as unknown as { finish(): void }).finish(); } catch { /* ignore */ }
+      try { deepgramSocket.requestClose(); } catch { /* ignore */ }
     }
 
     try {
@@ -262,35 +333,35 @@ wss.on('connection', (ws: WebSocket) => {
         throw err;
       }
 
-      // TTS: stream audio back to client
+      // TTS: buffer all PCM audio and wrap as WAV
       console.log(`[ElevenLabs] Sending TTS for: "${fullResponse}"`);
+      let audioBase64: string;
       try {
-        const totalBytes = await streamTTSToClient(
-          ws,
+        const { base64, totalBytes } = await bufferTTSToWav(
           streamElevenLabsTTS(fullResponse, config.voiceId, config.elevenLabsKey),
         );
+        audioBase64 = base64;
         console.log(`[ElevenLabs] TTS complete, total bytes: ${totalBytes}`);
       } catch (err: unknown) {
         console.error('[ElevenLabs] Error calling TTS:', err instanceof Error ? err.stack ?? err.message : err);
         throw err;
       }
 
-      // A2F blendshapes from accumulated user mic audio
-      if (config.nvidiaApiKey && config.nvidiaFunctionId && incomingAudioChunks.length > 0) {
-        const micAudio = Buffer.concat(incomingAudioChunks);
-        const frames = await fetchA2FBlendshapes(micAudio, 16000, config.nvidiaApiKey, config.nvidiaFunctionId);
-        for (const frame of frames) {
-          send(ws, { type: 'blendshapes', timestamp: frame.timestamp, values: frame.values });
-        }
-        incomingAudioChunks.length = 0;
+      // A2F blendshapes from TTS audio
+      let blendshapes: Array<{ timestamp: number; values: Record<string, number> }> = [];
+      if (config.nvidiaApiKey && config.nvidiaFunctionId) {
+        blendshapes = await fetchA2FBlendshapes(audioBase64, config.nvidiaApiKey, config.nvidiaFunctionId);
       }
+      incomingAudioChunks.length = 0;
 
+      // Send single combined response
+      send(ws, { type: 'npc_response', audio: audioBase64, blendshapes, fps: 30 });
       send(ws, { type: 'response_end' });
     } catch (err: unknown) {
       console.error('[Session] Pipeline error:', err instanceof Error ? err.stack ?? err.message : err);
       send(ws, { type: 'error', message: err instanceof Error ? err.message : 'Response error' });
     } finally {
-      await reconnectDeepgram().catch((err) => console.error('[Deepgram] Reconnect failed:', err));
+      try { reconnectDeepgram(); } catch (err) { console.error('[Deepgram] Reconnect failed:', err); }
       isSpeaking = false;
     }
   }
@@ -299,7 +370,7 @@ wss.on('connection', (ws: WebSocket) => {
     if (!config || isSpeaking) return;
     isSpeaking = true;
     if (deepgramSocket && deepgramReady) {
-      try { (deepgramSocket as unknown as { finish(): void }).finish(); } catch { /* ignore */ }
+      try { deepgramSocket.requestClose(); } catch { /* ignore */ }
     }
 
     const openai = new OpenAI({ apiKey: config.openAiKey });
@@ -325,34 +396,39 @@ wss.on('connection', (ws: WebSocket) => {
       console.log(`[startConversation] Greeting: "${fullResponse}"`);
       send(ws, { type: 'response_start' });
 
-      await streamTTSToClient(
-        ws,
+      const { base64: audioBase64 } = await bufferTTSToWav(
         streamElevenLabsTTS(fullResponse, config.voiceId, config.elevenLabsKey),
       );
 
+      let blendshapes: Array<{ timestamp: number; values: Record<string, number> }> = [];
+      if (config.nvidiaApiKey && config.nvidiaFunctionId) {
+        blendshapes = await fetchA2FBlendshapes(audioBase64, config.nvidiaApiKey, config.nvidiaFunctionId);
+      }
+
+      send(ws, { type: 'npc_response', audio: audioBase64, blendshapes, fps: 30 });
       send(ws, { type: 'response_end' });
     } catch (err: unknown) {
       console.error('[startConversation] Error:', err instanceof Error ? err.message : err);
       send(ws, { type: 'error', message: err instanceof Error ? err.message : 'Greeting error' });
     } finally {
-      await reconnectDeepgram().catch((err) => console.error('[Deepgram] Reconnect failed:', err));
+      try { reconnectDeepgram(); } catch (err) { console.error('[Deepgram] Reconnect failed:', err); }
       isSpeaking = false;
     }
   }
 
-  async function reconnectDeepgram() {
+  function reconnectDeepgram() {
     if (deepgramSocket) {
-      try { (deepgramSocket as unknown as { finish(): void }).finish(); } catch { /* ignore */ }
+      try { deepgramSocket.requestClose(); } catch { /* ignore */ }
       deepgramSocket = null;
       deepgramReady = false;
     }
-    await initDeepgram();
+    initDeepgram();
   }
 
-  async function initDeepgram() {
+  function initDeepgram() {
     if (!config) return;
-    const dg = new DeepgramClient({ apiKey: config.deepgramKey });
-    const socket = await dg.listen.v1.connect({
+    const dg = new DeepgramClient({ key: config.deepgramKey });
+    const socket = dg.listen.live({
       model: 'nova-3',
       language: 'en',
       smart_format: true,
@@ -361,17 +437,15 @@ wss.on('connection', (ws: WebSocket) => {
       endpointing: 400,
       encoding: 'linear16',
       sample_rate: 16000,
-      Authorization: `Token ${config.deepgramKey}`,
     });
 
-    socket.connect();
     deepgramSocket = socket;
 
     socket.on('open', () => {
       console.log('[Deepgram] Connection open');
       deepgramReady = true;
       for (const chunk of pendingAudioBuffer) {
-        socket.sendMedia(chunk);
+        socket.send(chunk);
       }
       pendingAudioBuffer.length = 0;
     });
@@ -383,8 +457,7 @@ wss.on('connection', (ws: WebSocket) => {
       console.error('[Deepgram] Error:', err);
       send(ws, { type: 'error', message: `ASR error: ${err.message}` });
     });
-    socket.on('message', (msg) => {
-      if (msg.type !== 'Results') return;
+    socket.on('Results', (msg) => {
       if (isSpeaking || processingUtterance) return;
 
       const alt = msg.channel?.alternatives?.[0];
@@ -445,15 +518,14 @@ wss.on('connection', (ws: WebSocket) => {
           nvidiaApiKey: msg.nvidiaApiKey ?? '',
           nvidiaFunctionId: msg.nvidiaFunctionId ?? '',
         };
-        initDeepgram()
-          .then(() => {
-            send(ws, { type: 'ready' });
-            console.log('[WS] Session initialized');
-            startConversation();
-          })
-          .catch((err: Error) => {
-            send(ws, { type: 'error', message: `ASR init failed: ${err.message}` });
-          });
+        try {
+          initDeepgram();
+          send(ws, { type: 'ready' });
+          console.log('[WS] Session initialized');
+          startConversation();
+        } catch (err: unknown) {
+          send(ws, { type: 'error', message: `ASR init failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
       } catch {
         send(ws, { type: 'error', message: 'Invalid init message' });
       }
@@ -464,7 +536,7 @@ wss.on('connection', (ws: WebSocket) => {
     if (isBinary) {
       incomingAudioChunks.push(Buffer.from(data));
       if (deepgramSocket && deepgramReady) {
-        deepgramSocket.sendMedia(data);
+        deepgramSocket.send(data);
       } else if (deepgramSocket) {
         pendingAudioBuffer.push(Buffer.from(data));
       }
@@ -473,7 +545,7 @@ wss.on('connection', (ws: WebSocket) => {
 
   ws.on('close', () => {
     console.log('[WS] Client disconnected');
-    deepgramSocket?.close();
+    deepgramSocket?.disconnect();
     deepgramSocket = null;
   });
 

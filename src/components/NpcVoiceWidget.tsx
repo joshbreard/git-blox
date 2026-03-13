@@ -5,11 +5,11 @@
  * 1. Captures mic via Web Audio API (ScriptProcessorNode → Int16 PCM at 16 kHz)
  * 2. Opens a WebSocket to the NPC voice backend
  * 3. Streams PCM + personality config on init
- * 4. Receives binary audio chunks → plays via AudioContext
- * 5. Receives blendshape JSON → applies to the active Three.js SkinnedMesh via morphTargetInfluences
+ * 4. Receives npc_response JSON with base64 WAV audio + blendshape frames
+ * 5. Decodes and plays audio; simultaneously steps through blendshape frames at 30fps via setInterval
  */
 
-import { useRef, useState, useCallback, useEffect } from 'react';
+import { useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { useEditorStore } from '../store/editorStore';
 import { engineRef } from '../engine/engineRef';
@@ -70,48 +70,17 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
   const streamRef = useRef<MediaStream | null>(null);
   const listeningRef = useRef<boolean>(false);
 
-  // Audio playback scheduling
-  const nextStartTimeRef = useRef<number>(0); // AudioContext time when next chunk is scheduled
-  const blendshapeQueueRef = useRef<BlendshapeFrame[]>([]);
-  const blendshapeOffsetRef = useRef<number>(0); // AudioContext time when NPC started speaking
-  const rafRef = useRef<number>(0);
+  const blendshapeIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const morphMeshRef = useRef<THREE.Mesh | null>(null);
 
   const isActive = status !== 'idle' && status !== 'error';
 
-  // ── Blendshape application loop ────────────────────────────────────────────
-  const applyBlendshapes = useCallback(() => {
-    rafRef.current = requestAnimationFrame(applyBlendshapes);
-    const ctx = audioCtxRef.current;
-    if (!ctx || !morphMeshRef.current) return;
-
-    const relTime = ctx.currentTime - blendshapeOffsetRef.current;
-    const queue = blendshapeQueueRef.current;
-    if (queue.length === 0) return;
-
-    // Find the frame closest to current playback time
-    let best = queue[0];
-    for (const frame of queue) {
-      if (Math.abs(frame.timestamp - relTime) < Math.abs(best.timestamp - relTime)) {
-        best = frame;
-      }
-    }
-
-    const mesh = morphMeshRef.current;
-    if (!mesh.morphTargetInfluences) return;
-    for (const [arkitKey, weight] of Object.entries(best.values)) {
-      const idx = resolveBlendshapeIndex(mesh, arkitKey);
-      if (idx >= 0) mesh.morphTargetInfluences[idx] = weight;
-    }
-  }, []);
-
-  useEffect(() => {
-    rafRef.current = requestAnimationFrame(applyBlendshapes);
-    return () => cancelAnimationFrame(rafRef.current);
-  }, [applyBlendshapes]);
-
   // ── Stop / cleanup ─────────────────────────────────────────────────────────
   const stop = useCallback(() => {
+    if (blendshapeIntervalRef.current) {
+      clearInterval(blendshapeIntervalRef.current);
+      blendshapeIntervalRef.current = null;
+    }
     processorRef.current?.disconnect();
     processorRef.current = null;
     micSourceRef.current?.disconnect();
@@ -121,7 +90,6 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
     wsRef.current?.close();
     wsRef.current = null;
     listeningRef.current = false;
-    nextStartTimeRef.current = 0;
     setStatus('idle');
 
     // Reset morph targets on the mesh
@@ -131,7 +99,6 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
         mesh.morphTargetInfluences[i] = 0;
       }
     }
-    blendshapeQueueRef.current = [];
     morphMeshRef.current = null;
   }, []);
 
@@ -193,21 +160,6 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
       };
 
       ws.onmessage = (event) => {
-        if (event.data instanceof ArrayBuffer) {
-          // Audio chunk — schedule playback
-          const ctx = audioCtxRef.current;
-          if (!ctx) return;
-          ctx.decodeAudioData(event.data.slice(0)).then((decoded) => {
-            const src = ctx.createBufferSource();
-            src.buffer = decoded;
-            src.connect(ctx.destination);
-            const startAt = Math.max(ctx.currentTime, nextStartTimeRef.current);
-            src.start(startAt);
-            nextStartTimeRef.current = startAt + decoded.duration;
-          }).catch(() => { /* non-fatal decode error */ });
-          return;
-        }
-
         try {
           const msg = JSON.parse(event.data as string) as { type: string; [k: string]: unknown };
           switch (msg.type) {
@@ -219,26 +171,55 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
             case 'response_start':
               listeningRef.current = false;
               setStatus('responding');
-              nextStartTimeRef.current = audioCtxRef.current?.currentTime ?? 0;
-              blendshapeOffsetRef.current = audioCtxRef.current?.currentTime ?? 0;
-              blendshapeQueueRef.current = [];
               break;
+            case 'npc_response': {
+              const audioB64 = msg.audio as string;
+              const frames = msg.blendshapes as BlendshapeFrame[];
+              const fps = (msg.fps as number) ?? 30;
+
+              // Decode base64 WAV → ArrayBuffer and play
+              const bytes = Uint8Array.from(atob(audioB64), (c) => c.charCodeAt(0));
+              const ctx = audioCtxRef.current;
+              if (ctx) {
+                ctx.decodeAudioData(bytes.buffer.slice(0)).then((decoded) => {
+                  const src = ctx.createBufferSource();
+                  src.buffer = decoded;
+                  src.connect(ctx.destination);
+                  src.start(ctx.currentTime);
+                }).catch(() => { /* non-fatal */ });
+              }
+
+              // Drive blendshapes at fps via setInterval
+              if (blendshapeIntervalRef.current) clearInterval(blendshapeIntervalRef.current);
+              const mesh = morphMeshRef.current;
+              if (mesh && frames.length > 0) {
+                let frameIdx = 0;
+                blendshapeIntervalRef.current = setInterval(() => {
+                  if (frameIdx >= frames.length) {
+                    clearInterval(blendshapeIntervalRef.current!);
+                    blendshapeIntervalRef.current = null;
+                    return;
+                  }
+                  const frame = frames[frameIdx++];
+                  if (!mesh.morphTargetInfluences || !mesh.morphTargetDictionary) return;
+                  for (const [arkitKey, weight] of Object.entries(frame.values)) {
+                    const idx = resolveBlendshapeIndex(mesh, arkitKey);
+                    if (idx >= 0) mesh.morphTargetInfluences[idx] = weight;
+                  }
+                }, 1000 / fps);
+              }
+              break;
+            }
             case 'response_end':
               listeningRef.current = true;
               setStatus('listening');
-              break;
-            case 'blendshapes':
-              blendshapeQueueRef.current.push({
-                timestamp: msg.timestamp as number,
-                values: msg.values as Record<string, number>,
-              });
               break;
             case 'error':
               setErrorMsg(String(msg.message ?? 'Server error'));
               setStatus('error');
               break;
           }
-        } catch { /* non-JSON binary frame handled above */ }
+        } catch { /* ignore parse errors */ }
       };
 
       ws.onerror = () => {

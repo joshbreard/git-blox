@@ -21,9 +21,7 @@ export interface NpcConfig {
 }
 
 export const NVIDIA_A2F_MODELS = [
-  { label: 'Mark',  id: '8efc55f5-6f00-424e-afe9-26212cd2c630' },
-  { label: 'Claire', id: '0961a6da-fb9e-4f2e-8491-247e5fd7bf8d' },
-  { label: 'James',  id: '9327c39f-a361-4e02-bd72-e11b4c9b7b5e' },
+  { label: 'audio2face-2b', id: '462f7ebb-fb5e-4477-8bab-e30b7f2f9249' },
 ] as const;
 
 export type GeometryType =
