@@ -2,7 +2,7 @@
  * NpcVoiceWidget
  *
  * "Talk to NPC" button that:
- * 1. Captures mic via Web Audio API (ScriptProcessorNode → Int16 PCM at 16 kHz)
+ * 1. Captures mic via Web Audio API (AudioWorkletNode → Int16 PCM at 16 kHz)
  * 2. Opens a WebSocket to the NPC voice backend
  * 3. Streams PCM + personality config on init
  * 4. Receives npc_response JSON with base64 WAV audio + blendshape frames
@@ -17,7 +17,6 @@ import arkitMap from '../engine/arkit-blendshape-map.json';
 
 const WS_URL = 'ws://localhost:3001';
 const TARGET_SAMPLE_RATE = 16000;
-const SCRIPT_PROC_BUFFER = 2048;
 
 type Status = 'idle' | 'connecting' | 'listening' | 'responding' | 'error';
 
@@ -40,27 +39,6 @@ function resolveBlendshapeIndex(
     if (name in dict) return dict[name];
   }
   return -1;
-}
-
-/** Parse a WAV buffer and return the byte offset where the PCM data chunk begins.
- *  Scans RIFF sub-chunks for the "data" fourCC. Falls back to 44 if not found. */
-function findWavDataOffset(bytes: Uint8Array): number {
-  // Minimum valid RIFF header is 12 bytes ("RIFF" + size + "WAVE")
-  if (bytes.length < 12) return 44;
-  const dec = new TextDecoder('ascii');
-  const riff = dec.decode(bytes.slice(0, 4));
-  const wave = dec.decode(bytes.slice(8, 12));
-  if (riff !== 'RIFF' || wave !== 'WAVE') return 44;
-  let offset = 12;
-  while (offset + 8 <= bytes.length) {
-    const id = dec.decode(bytes.slice(offset, offset + 4));
-    const chunkSize = new DataView(bytes.buffer, bytes.byteOffset + offset + 4, 4).getUint32(0, true);
-    offset += 8;
-    if (id === 'data') return offset;
-    // Chunks are word-aligned — advance by chunkSize rounded up to even
-    offset += chunkSize + (chunkSize & 1);
-  }
-  return 44;
 }
 
 /** Find the first SkinnedMesh descendant of an Object3D that has morph targets. */
@@ -90,7 +68,7 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const playbackCtxRef = useRef<AudioContext | null>(null);
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const processorRef = useRef<AudioWorkletNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const listeningRef = useRef<boolean>(false);
 
@@ -173,23 +151,23 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
       // Calling resume() later (e.g. inside ws.onmessage) may be blocked by
       // browsers that require AudioContext activation from a user gesture.
       await audioCtx.resume();
+      await audioCtx.audioWorklet.addModule('/mic-processor.js');
       audioCtxRef.current = audioCtx;
 
       // Separate AudioContext for NPC audio playback — created and resumed here
       // inside the user gesture so it is guaranteed to be in "running" state
       // when npc_response arrives. Reusing a single context avoids the
       // create/close churn per response that causes CoreAudio pops and static.
-      const playbackCtx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
+      const playbackCtx = new AudioContext();
       await playbackCtx.resume();
       playbackCtxRef.current = playbackCtx;
 
       const micSource = audioCtx.createMediaStreamSource(stream);
       micSourceRef.current = micSource;
 
-      const processor = audioCtx.createScriptProcessor(SCRIPT_PROC_BUFFER, 1, 1);
+      const processor = new AudioWorkletNode(audioCtx, 'mic-processor');
       processorRef.current = processor;
       micSource.connect(processor);
-      processor.connect(audioCtx.createGain());
 
       // ── WebSocket ─────────────────────────────────────────────────────────
       const ws = new WebSocket(WS_URL);
@@ -231,35 +209,18 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
               // Record when audio starts so blendshapes arriving later can sync
               audioStartMsRef.current = performance.now();
 
-              // Decode base64 WAV → AudioBuffer and play.
-              // We bypass decodeAudioData because browsers reject PCM WAVs whose
-              // data chunk has an odd byte length (ElevenLabs pcm_16000 sometimes
-              // returns an odd number of bytes, making the RIFF headers invalid).
-              // Instead, manually parse the known format: 44-byte header, 16kHz,
-              // mono, Int16 little-endian PCM.
-              const bytes = Uint8Array.from(atob(audioB64), (c) => c.charCodeAt(0));
-              console.log('[Audio] Received WAV, byte length:', bytes.length);
               const playCtx = playbackCtxRef.current;
               if (playCtx) {
-                try {
-                  const WAV_HEADER = findWavDataOffset(bytes);
-                  const pcmBytes = bytes.length - WAV_HEADER;
-                  const numSamples = Math.floor(pcmBytes / 2);
-                  const audioBuffer = playCtx.createBuffer(1, numSamples, TARGET_SAMPLE_RATE);
-                  const channelData = audioBuffer.getChannelData(0);
-                  const view = new DataView(bytes.buffer, bytes.byteOffset + WAV_HEADER);
-                  for (let i = 0; i < numSamples; i++) {
-                    channelData[i] = view.getInt16(i * 2, true) / 32768;
-                  }
-                  console.log('[Audio] PCM decoded — samples:', numSamples,
-                    'duration:', audioBuffer.duration.toFixed(2), 's');
+                const binary = atob(audioB64);
+                const arrayBuf = new ArrayBuffer(binary.length);
+                const u8 = new Uint8Array(arrayBuf);
+                for (let i = 0; i < binary.length; i++) u8[i] = binary.charCodeAt(i);
+                playCtx.decodeAudioData(arrayBuf).then(buf => {
                   const src = playCtx.createBufferSource();
-                  src.buffer = audioBuffer;
+                  src.buffer = buf;
                   src.connect(playCtx.destination);
-                  src.start(playCtx.currentTime);
-                } catch (err) {
-                  console.error('[Audio] PCM decode failed:', err);
-                }
+                  src.start();
+                }).catch(err => console.error('[Audio] decodeAudioData failed:', err));
               } else {
                 console.error('[Audio] Playback AudioContext is null — cannot play');
               }
@@ -350,14 +311,9 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
       };
 
       // ── PCM streaming ─────────────────────────────────────────────────────
-      processor.onaudioprocess = (e) => {
+      processor.port.onmessage = (e: MessageEvent<Int16Array>) => {
         if (!listeningRef.current || ws.readyState !== WebSocket.OPEN) return;
-        const float32 = e.inputBuffer.getChannelData(0);
-        const int16 = new Int16Array(float32.length);
-        for (let i = 0; i < float32.length; i++) {
-          int16[i] = Math.max(-32768, Math.min(32767, float32[i] * 32768));
-        }
-        ws.send(int16.buffer);
+        ws.send(e.data.buffer);
       };
     } catch (err: unknown) {
       setErrorMsg(err instanceof Error ? err.message : 'Microphone access denied');

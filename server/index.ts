@@ -33,6 +33,9 @@ import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
+import { execFile } from 'child_process';
+import * as fs from 'fs';
+import * as crypto from 'crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -58,20 +61,38 @@ function sendBinary(ws: WebSocket, buf: Buffer | Uint8Array) {
   if (ws.readyState === WebSocket.OPEN) ws.send(buf);
 }
 
-/** Buffer all TTS PCM chunks, wrap in a WAV header, and return both buffer and base64. */
-async function bufferTTSToWav(
+/** Buffer all TTS MP3 chunks and return the raw MP3 buffer and its base64 encoding. */
+async function bufferTTSToMp3(
   source: AsyncIterable<Buffer>,
-): Promise<{ wavBuffer: Buffer; base64: string; totalBytes: number }> {
+): Promise<{ mp3Buffer: Buffer; base64: string }> {
   const chunks: Buffer[] = [];
-  let totalBytes = 0;
   for await (const chunk of source) {
     chunks.push(chunk);
-    totalBytes += chunk.length;
   }
-  const pcm = Buffer.concat(chunks);
-  const wavBuffer = pcmToWav(pcm, 16000, 1, 16);
-  const base64 = wavBuffer.toString('base64');
-  return { wavBuffer, base64, totalBytes };
+  const mp3Buffer = Buffer.concat(chunks);
+  const base64 = mp3Buffer.toString('base64');
+  return { mp3Buffer, base64 };
+}
+
+/** Convert an MP3 buffer to a 16kHz mono WAV buffer (base64) via ffmpeg. */
+async function mp3ToWavBase64(mp3Buffer: Buffer): Promise<string> {
+  const tmpId = crypto.randomBytes(8).toString('hex');
+  const inputPath = path.join('/tmp', `a2f_in_${tmpId}.mp3`);
+  const outputPath = path.join('/tmp', `a2f_out_${tmpId}.wav`);
+  try {
+    await fs.promises.writeFile(inputPath, mp3Buffer);
+    await new Promise<void>((resolve, reject) => {
+      execFile('ffmpeg', ['-y', '-i', inputPath, '-ar', '16000', '-ac', '1', '-f', 'wav', outputPath], (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+    const wavBuffer = await fs.promises.readFile(outputPath);
+    return wavBuffer.toString('base64');
+  } finally {
+    await fs.promises.unlink(inputPath).catch(() => {});
+    await fs.promises.unlink(outputPath).catch(() => {});
+  }
 }
 
 /**
@@ -94,7 +115,7 @@ async function* streamElevenLabsTTS(
     body: JSON.stringify({
       text,
       model_id: 'eleven_flash_v2_5',
-      output_format: 'pcm_16000',
+      output_format: 'mp3_44100_128',
     }),
   });
 
@@ -283,34 +304,6 @@ async function fetchA2FBlendshapes(
   return [];
 }
 
-/** Build a minimal WAV header around raw Int16 PCM. */
-function pcmToWav(
-  pcm: Buffer,
-  sampleRate: number,
-  channels: number,
-  bitDepth: number,
-): Buffer {
-  const headerSize = 44;
-  const byteRate = (sampleRate * channels * bitDepth) / 8;
-  const blockAlign = (channels * bitDepth) / 8;
-  const buf = Buffer.alloc(headerSize + pcm.length);
-  buf.write('RIFF', 0);
-  buf.writeUInt32LE(36 + pcm.length, 4);
-  buf.write('WAVE', 8);
-  buf.write('fmt ', 12);
-  buf.writeUInt32LE(16, 16); // PCM subchunk size
-  buf.writeUInt16LE(1, 20); // AudioFormat=PCM
-  buf.writeUInt16LE(channels, 22);
-  buf.writeUInt32LE(sampleRate, 24);
-  buf.writeUInt32LE(byteRate, 28);
-  buf.writeUInt16LE(blockAlign, 32);
-  buf.writeUInt16LE(bitDepth, 34);
-  buf.write('data', 36);
-  buf.writeUInt32LE(pcm.length, 40);
-  pcm.copy(buf, 44);
-  return buf;
-}
-
 // ─── WebSocket session handler ────────────────────────────────────────────────
 
 interface SessionConfig {
@@ -376,15 +369,15 @@ wss.on('connection', (ws: WebSocket) => {
         throw err;
       }
 
-      // TTS: buffer all PCM audio and wrap as WAV
+      // TTS: buffer all MP3 audio
       console.log(`[ElevenLabs] Sending TTS for: "${fullResponse}"`);
+      let mp3Buffer: Buffer;
       let audioBase64: string;
       try {
-        const { base64, totalBytes } = await bufferTTSToWav(
+        ({ mp3Buffer, base64: audioBase64 } = await bufferTTSToMp3(
           streamElevenLabsTTS(fullResponse, config.voiceId, config.elevenLabsKey),
-        );
-        audioBase64 = base64;
-        console.log(`[ElevenLabs] TTS complete, total bytes: ${totalBytes}`);
+        ));
+        console.log(`[ElevenLabs] TTS complete, total bytes: ${mp3Buffer.length}`);
       } catch (err: unknown) {
         console.error('[ElevenLabs] Error calling TTS:', err instanceof Error ? err.stack ?? err.message : err);
         throw err;
@@ -392,15 +385,17 @@ wss.on('connection', (ws: WebSocket) => {
 
       incomingAudioChunks.length = 0;
 
-      // Send audio immediately — do NOT block on A2F
+      // Send MP3 audio immediately — do NOT block on A2F
       send(ws, { type: 'npc_response', audio: audioBase64, blendshapes: [], fps: 30 });
       send(ws, { type: 'response_end' });
 
-      // Run A2F in background; send blendshapes when ready so client can animate
+      // Run A2F in background; convert MP3→WAV then fetch blendshapes
       if (config.nvidiaApiKey && config.nvidiaFunctionId) {
         const capturedConfig = config;
+        const capturedMp3 = mp3Buffer;
         const audioSentAt = Date.now();
-        fetchA2FBlendshapes(audioBase64, capturedConfig.nvidiaApiKey, capturedConfig.nvidiaFunctionId)
+        mp3ToWavBase64(capturedMp3)
+          .then((wavBase64) => fetchA2FBlendshapes(wavBase64, capturedConfig.nvidiaApiKey, capturedConfig.nvidiaFunctionId))
           .then((frames) => {
             if (frames.length > 0) {
               send(ws, { type: 'npc_blendshapes', frames, fps: 30, audioOffsetMs: Date.now() - audioSentAt });
@@ -447,19 +442,21 @@ wss.on('connection', (ws: WebSocket) => {
       console.log(`[startConversation] Greeting: "${fullResponse}"`);
       send(ws, { type: 'response_start' });
 
-      const { base64: audioBase64 } = await bufferTTSToWav(
+      const { mp3Buffer, base64: audioBase64 } = await bufferTTSToMp3(
         streamElevenLabsTTS(fullResponse, config.voiceId, config.elevenLabsKey),
       );
 
-      // Send audio immediately — do NOT block on A2F
+      // Send MP3 audio immediately — do NOT block on A2F
       send(ws, { type: 'npc_response', audio: audioBase64, blendshapes: [], fps: 30 });
       send(ws, { type: 'response_end' });
 
-      // Run A2F in background; send blendshapes when ready so client can animate
+      // Run A2F in background; convert MP3→WAV then fetch blendshapes
       if (config.nvidiaApiKey && config.nvidiaFunctionId) {
         const capturedConfig = config;
+        const capturedMp3 = mp3Buffer;
         const audioSentAt = Date.now();
-        fetchA2FBlendshapes(audioBase64, capturedConfig.nvidiaApiKey, capturedConfig.nvidiaFunctionId)
+        mp3ToWavBase64(capturedMp3)
+          .then((wavBase64) => fetchA2FBlendshapes(wavBase64, capturedConfig.nvidiaApiKey, capturedConfig.nvidiaFunctionId))
           .then((frames) => {
             if (frames.length > 0) {
               send(ws, { type: 'npc_blendshapes', frames, fps: 30, audioOffsetMs: Date.now() - audioSentAt });
