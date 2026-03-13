@@ -10,6 +10,8 @@ export interface LoadedModel {
   animations: THREE.AnimationClip[];
   /** Original scene root, only set when animations are present */
   scene: THREE.Object3D | null;
+  /** True for GLB/GLTF imports where the scene hierarchy is used as-is */
+  hasScene: boolean;
 }
 
 function extractGeometries(object: THREE.Object3D): THREE.BufferGeometry[] {
@@ -32,16 +34,33 @@ export async function loadModelFile(file: File): Promise<LoadedModel> {
   const arrayBuffer = await file.arrayBuffer();
   const url = URL.createObjectURL(new Blob([arrayBuffer]));
 
-  let root: THREE.Object3D;
-  let animations: THREE.AnimationClip[] = [];
-
   try {
     if (ext === 'glb' || ext === 'gltf') {
       const loader = new GLTFLoader();
       const gltf = await loader.loadAsync(url);
-      root = gltf.scene;
-      animations = gltf.animations ?? [];
-    } else if (ext === 'fbx') {
+      // Preserve morph targets and skinning by keeping the full scene hierarchy.
+      // Normalize height the same way as other formats, but operate on the root
+      // transform so submesh geometry (and its morph data) is never cloned.
+      const root = gltf.scene;
+      const box = new THREE.Box3().setFromObject(root);
+      const height = box.max.y - box.min.y;
+      if (height > 0.001) {
+        const s = 2 / height;
+        root.scale.multiplyScalar(s);
+      }
+      return {
+        name,
+        geometry: new THREE.BufferGeometry(),
+        animations: gltf.animations ?? [],
+        scene: root,
+        hasScene: true,
+      };
+    }
+
+    let root: THREE.Object3D;
+    let animations: THREE.AnimationClip[] = [];
+
+    if (ext === 'fbx') {
       const loader = new FBXLoader();
       root = await loader.loadAsync(url);
       animations = (root as THREE.Group & { animations?: THREE.AnimationClip[] }).animations ?? [];
@@ -52,41 +71,42 @@ export async function loadModelFile(file: File): Promise<LoadedModel> {
     } else {
       throw new Error(`Unsupported format: .${ext}`);
     }
+
+    const geos = extractGeometries(root);
+    if (geos.length === 0) throw new Error('No meshes found in file');
+
+    let merged: THREE.BufferGeometry;
+    if (geos.length === 1) {
+      merged = geos[0];
+    } else {
+      const normalized = geos.map((g) => {
+        if (!g.index) return g;
+        return g.toNonIndexed();
+      });
+      merged = mergeGeometries(normalized, false) ?? normalized[0];
+    }
+
+    merged.computeVertexNormals();
+    merged.computeBoundingBox();
+
+    const TARGET_HEIGHT = 2;
+    const box = merged.boundingBox!;
+    const height = box.max.y - box.min.y;
+    if (height > 0.001) {
+      const s = TARGET_HEIGHT / height;
+      merged.scale(s, s, s);
+      root.scale.multiplyScalar(s);
+    }
+    merged.computeBoundingSphere();
+
+    return {
+      name,
+      geometry: merged,
+      animations,
+      scene: root,
+      hasScene: false,
+    };
   } finally {
     URL.revokeObjectURL(url);
   }
-
-  const geos = extractGeometries(root);
-  if (geos.length === 0) throw new Error('No meshes found in file');
-
-  let merged: THREE.BufferGeometry;
-  if (geos.length === 1) {
-    merged = geos[0];
-  } else {
-    const normalized = geos.map((g) => {
-      if (!g.index) return g;
-      return g.toNonIndexed();
-    });
-    merged = mergeGeometries(normalized, false) ?? normalized[0];
-  }
-
-  merged.computeVertexNormals();
-  merged.computeBoundingBox();
-
-  const TARGET_HEIGHT = 2;
-  const box = merged.boundingBox!;
-  const height = box.max.y - box.min.y;
-  if (height > 0.001) {
-    const s = TARGET_HEIGHT / height;
-    merged.scale(s, s, s);
-    root.scale.multiplyScalar(s);
-  }
-  merged.computeBoundingSphere();
-
-  return {
-    name,
-    geometry: merged,
-    animations,
-    scene: root,
-  };
 }

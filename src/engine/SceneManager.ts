@@ -62,11 +62,12 @@ export class SceneManager {
     geometry: THREE.BufferGeometry,
     scene: THREE.Object3D | null,
     clips: THREE.AnimationClip[],
+    hasScene = !!scene,
   ): string {
     const store = useEditorStore.getState();
     const id = store.peekNextId();
 
-    if (scene) {
+    if (hasScene && scene) {
       this.sceneCache.set(id, scene);
       if (clips.length > 0) this.clipsCache.set(id, clips);
     } else {
@@ -108,6 +109,18 @@ export class SceneManager {
       cachedScene.visible = obj.visible;
       this.viewport.scene.add(cachedScene);
       this.meshMap.set(obj.id, cachedScene);
+
+      cachedScene.traverse((child) => {
+        if ((child as THREE.Mesh).isMesh) {
+          const m = child as THREE.Mesh;
+          if (m.morphTargetInfluences) {
+            console.log(
+              '[SceneManager] Morph targets found on', child.name,
+              '—', Object.keys(m.morphTargetDictionary ?? {}).length, 'targets',
+            );
+          }
+        }
+      });
 
       const clips = this.clipsCache.get(obj.id);
       if (clips) {

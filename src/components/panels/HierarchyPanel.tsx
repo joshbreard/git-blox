@@ -51,8 +51,8 @@ function AddMenu() {
     const file = e.target.files?.[0];
     if (!file) return;
     try {
-      const { name, geometry, animations, scene } = await loadModelFile(file);
-      engineRef.current?.sceneManager.importModel(name, geometry, scene, animations);
+      const { name, geometry, animations, scene, hasScene } = await loadModelFile(file);
+      engineRef.current?.sceneManager.importModel(name, geometry, scene, animations, hasScene);
     } catch (err) {
       console.error('Import failed:', err);
     }

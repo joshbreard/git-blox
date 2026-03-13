@@ -90,6 +90,8 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
     micSourceRef.current = null;
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
+    audioCtxRef.current?.close().catch(() => {});
+    audioCtxRef.current = null;
     wsRef.current?.close();
     wsRef.current = null;
     listeningRef.current = false;
@@ -126,6 +128,16 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
       const sceneObj = engineRef.current?.sceneManager?.getMeshById(objectId);
       if (sceneObj) {
         morphMeshRef.current = findMorphMesh(sceneObj);
+        if (morphMeshRef.current) {
+          const names = Object.keys(morphMeshRef.current.morphTargetDictionary ?? {});
+          console.log('[NpcVoice] Morph mesh found:', morphMeshRef.current.name,
+            '—', names.length, 'targets:', names.slice(0, 10).join(', '));
+        } else {
+          console.warn('[NpcVoice] No morph mesh found on object', objectId,
+            '— re-import the GLB and check [SceneManager] logs for morph target counts');
+        }
+      } else {
+        console.warn('[NpcVoice] getMeshById returned null for', objectId);
       }
 
       // ── Mic capture ───────────────────────────────────────────────────────
@@ -133,6 +145,10 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
       streamRef.current = stream;
 
       const audioCtx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
+      // Resume immediately while still inside the user-gesture call stack.
+      // Calling resume() later (e.g. inside ws.onmessage) may be blocked by
+      // browsers that require AudioContext activation from a user gesture.
+      await audioCtx.resume();
       audioCtxRef.current = audioCtx;
 
       const micSource = audioCtx.createMediaStreamSource(stream);
@@ -183,18 +199,38 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
               // Record when audio starts so blendshapes arriving later can sync
               audioStartMsRef.current = performance.now();
 
-              // Decode base64 WAV → ArrayBuffer and play
+              // Decode base64 WAV → AudioBuffer and play.
+              // We bypass decodeAudioData because browsers reject PCM WAVs whose
+              // data chunk has an odd byte length (ElevenLabs pcm_16000 sometimes
+              // returns an odd number of bytes, making the RIFF headers invalid).
+              // Instead, manually parse the known format: 44-byte header, 16kHz,
+              // mono, Int16 little-endian PCM.
               const bytes = Uint8Array.from(atob(audioB64), (c) => c.charCodeAt(0));
+              console.log('[Audio] Received WAV, byte length:', bytes.length,
+                'AudioContext state:', audioCtxRef.current?.state);
               const ctx = audioCtxRef.current;
               if (ctx) {
-                ctx.resume().then(() => {
-                  ctx.decodeAudioData(bytes.buffer.slice(0)).then((decoded) => {
-                    const src = ctx.createBufferSource();
-                    src.buffer = decoded;
-                    src.connect(ctx.destination);
-                    src.start(ctx.currentTime);
-                  }).catch((err) => { console.error('[Audio] decodeAudioData failed:', err); });
-                }).catch((err) => { console.error('[Audio] AudioContext resume failed:', err); });
+                try {
+                  const WAV_HEADER = 44;
+                  const pcmBytes = bytes.length - WAV_HEADER;
+                  const numSamples = Math.floor(pcmBytes / 2);
+                  const audioBuffer = ctx.createBuffer(1, numSamples, TARGET_SAMPLE_RATE);
+                  const channelData = audioBuffer.getChannelData(0);
+                  const view = new DataView(bytes.buffer, bytes.byteOffset + WAV_HEADER);
+                  for (let i = 0; i < numSamples; i++) {
+                    channelData[i] = view.getInt16(i * 2, true) / 32768;
+                  }
+                  console.log('[Audio] PCM decoded — samples:', numSamples,
+                    'duration:', audioBuffer.duration.toFixed(2), 's');
+                  const src = ctx.createBufferSource();
+                  src.buffer = audioBuffer;
+                  src.connect(ctx.destination);
+                  src.start(ctx.currentTime);
+                } catch (err) {
+                  console.error('[Audio] PCM decode failed:', err);
+                }
+              } else {
+                console.error('[Audio] AudioContext is null — cannot play');
               }
 
               // Drive blendshapes inline only if server sent them with the audio (warm A2F path)
@@ -224,16 +260,26 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
               const frames = msg.frames as BlendshapeFrame[];
               const fps = (msg.fps as number) ?? 30;
               const mesh = morphMeshRef.current;
-              if (!mesh || frames.length === 0) break;
+              if (!mesh || frames.length === 0) {
+                console.warn('[NpcVoice] npc_blendshapes received but',
+                  !mesh ? 'morph mesh is null' : 'frames array is empty');
+                break;
+              }
 
               const elapsedMs = performance.now() - audioStartMsRef.current;
-              const startFrameIdx = Math.min(
-                Math.floor(elapsedMs / (1000 / fps)),
-                frames.length - 1,
-              );
+              const totalDurationMs = (frames.length / fps) * 1000;
+              // If A2F arrived after the audio already finished, replay from frame 0.
+              // Without this guard startFrameIdx is clamped to frames.length-1 and
+              // the interval fires exactly once — no visible animation.
+              const rawStartIdx = Math.floor(elapsedMs / (1000 / fps));
+              const startFrameIdx = rawStartIdx >= frames.length ? 0
+                : Math.min(rawStartIdx, frames.length - 1);
+              console.log('[NpcVoice] npc_blendshapes — frames:', frames.length,
+                'elapsedMs:', elapsedMs.toFixed(0), 'totalDurationMs:', totalDurationMs.toFixed(0),
+                'startFrame:', startFrameIdx, elapsedMs >= totalDurationMs ? '(replaying from 0)' : '(synced)');
 
               if (blendshapeIntervalRef.current) clearInterval(blendshapeIntervalRef.current);
-              let frameIdx = Math.max(0, startFrameIdx);
+              let frameIdx = startFrameIdx;
               blendshapeIntervalRef.current = setInterval(() => {
                 if (frameIdx >= frames.length) {
                   clearInterval(blendshapeIntervalRef.current!);
