@@ -135,20 +135,28 @@ async function fetchA2FBlendshapesOnce(
   try {
     const protoDir = path.resolve(__dirname, 'proto');
     const packageDef = protoLoader.loadSync(
-      path.join(protoDir, 'a2f_nvcf.proto'),
+      path.join(protoDir, 'nvidia_ace.services.a2f_controller.v1.proto'),
       {
         keepCase: true,
         longs: Number,
         enums: Number,
         defaults: true,
         oneofs: true,
-        includeDirs: [protoDir],
+        includeDirs: [
+          protoDir,
+          path.resolve(__dirname, '..', 'proto'),
+          path.resolve(__dirname, 'server', 'proto'),
+        ],
       },
     );
 
     const grpcObj = grpc.loadPackageDefinition(packageDef) as Record<string, unknown>;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const A2FServiceClient = (((grpcObj.nvidia_ace as any).services.a2f.v1) as any).A2FService;
+    console.log('[A2F] grpcObj top-level keys:', JSON.stringify(Object.keys(grpcObj)));
+
+    const svc = (grpcObj as any)?.nvidia_ace?.services?.a2f_controller?.v1;
+    console.log('[A2F] Available service keys:', JSON.stringify(Object.keys(svc ?? {})));
+    const A2FServiceClient = svc?.A2FControllerService;
+    if (!A2FServiceClient) throw new Error('[A2F] A2FControllerService not found in loaded proto');
 
     const meta = new grpc.Metadata();
     meta.set('authorization', `Bearer ${nvidiaApiKey}`);
@@ -166,7 +174,7 @@ async function fetchA2FBlendshapesOnce(
       },
     );
 
-    console.log(`[A2F] Calling /nvidia_ace.services.a2f.v1.A2FService/PushAudioStream on grpc.nvcf.nvidia.com:443`);
+    console.log(`[A2F] Calling /nvidia_ace.services.a2f_controller.v1.A2FControllerService/ProcessAudioStream on grpc.nvcf.nvidia.com:443`);
 
     return new Promise((resolve) => {
       const blendshapeNames: string[] = [];
@@ -176,7 +184,7 @@ async function fetchA2FBlendshapesOnce(
       // Set a deadline to accommodate NVCF cold-start worker provisioning.
       const deadline = new Date(Date.now() + 30_000);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const call = (client as any).pushAudioStream(meta, { deadline });
+      const call = (client as any).processAudioStream(meta, { deadline });
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       call.on('data', (msg: any) => {
@@ -219,6 +227,7 @@ async function fetchA2FBlendshapesOnce(
       // ── Send audio ───────────────────────────────────────────────────────────
 
       // First message: AudioStreamHeader describing the PCM format.
+      // Uses nvidia_ace.controller.v1.AudioStream.AudioStreamHeader (no animation_ids field).
       call.write({
         audio_stream_header: {
           audio_header: {
@@ -243,6 +252,8 @@ async function fetchA2FBlendshapesOnce(
         });
       }
 
+      // Signal end of audio before closing the stream.
+      call.write({ end_of_audio: {} });
       call.end();
     });
   } catch (err) {

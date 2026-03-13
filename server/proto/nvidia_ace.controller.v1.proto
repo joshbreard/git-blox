@@ -1,0 +1,35 @@
+syntax = "proto3";
+package nvidia_ace.controller.v1;
+
+import "nvidia_ace.a2f.v1.proto";
+import "nvidia_ace.animation_data.v1.proto";
+import "nvidia_ace.audio.v1.proto";
+import "nvidia_ace.status.v1.proto";
+
+message AudioStream {
+  message EndOfAudio {}
+  oneof stream_part {
+    AudioStreamHeader audio_stream_header = 1;
+    nvidia_ace.a2f.v1.AudioWithEmotion audio_with_emotion = 2;
+    EndOfAudio end_of_audio = 3;
+  }
+  message AudioStreamHeader {
+    nvidia_ace.audio.v1.AudioHeader audio_header = 1;
+    nvidia_ace.a2f.v1.FaceParameters face_params = 2;
+    nvidia_ace.a2f.v1.EmotionPostProcessingParameters emotion_post_processing_params = 3;
+    nvidia_ace.a2f.v1.BlendShapeParameters blendshape_params = 4;
+    nvidia_ace.a2f.v1.EmotionParameters emotion_params = 5;
+  }
+}
+
+message AnimationDataStream {
+  oneof stream_part {
+    AnimationDataStreamHeader animation_data_stream_header = 1;
+    nvidia_ace.animation_data.v1.AnimationData animation_data = 2;
+    nvidia_ace.status.v1.Status status = 4;
+  }
+  message AnimationDataStreamHeader {
+    optional nvidia_ace.audio.v1.AudioHeader audio_header = 1;
+    optional nvidia_ace.animation_data.v1.SkelAnimationHeader skel_animation_header = 2;
+  }
+}

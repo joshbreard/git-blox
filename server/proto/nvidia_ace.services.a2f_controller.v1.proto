@@ -1,0 +1,9 @@
+syntax = "proto3";
+package nvidia_ace.services.a2f_controller.v1;
+
+import "nvidia_ace.controller.v1.proto";
+
+service A2FControllerService {
+  rpc ProcessAudioStream(stream nvidia_ace.controller.v1.AudioStream)
+      returns (stream nvidia_ace.controller.v1.AnimationDataStream) {}
+}
