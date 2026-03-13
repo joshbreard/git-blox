@@ -247,11 +247,10 @@ async function fetchA2FBlendshapesOnce(
 
       // ── Send audio ───────────────────────────────────────────────────────────
 
-      // First message: AudioStreamHeader. audio_format=1 (WAV) since we send a full WAV buffer.
       call.write({
         audio_stream_header: {
           audio_header: {
-            audio_format: 1,        // 1 = AUDIO_FORMAT_WAV
+            audio_format: 0,
             channel_count: 1,
             samples_per_second: 16000,
             bits_per_sample: 16,
@@ -259,17 +258,12 @@ async function fetchA2FBlendshapesOnce(
         },
       });
 
-      // Subsequent messages: full WAV buffer (header + PCM) in audio_with_emotion chunks.
-      // A2F reads the format from the WAV header bytes in the buffer.
       const wavBuf = Buffer.from(audioBase64, 'base64');
-      const CHUNK_SIZE = 4096;
-      for (let offset = 0; offset < wavBuf.length; offset += CHUNK_SIZE) {
-        call.write({
-          audio_with_emotion: {
-            audio_buffer: wavBuf.subarray(offset, offset + CHUNK_SIZE),
-          },
-        });
-      }
+      call.write({
+        audio_with_emotion: {
+          audio_buffer: wavBuf,
+        },
+      });
 
       call.end();
     });
