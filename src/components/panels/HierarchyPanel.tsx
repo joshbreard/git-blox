@@ -1,8 +1,10 @@
 import { useState, useRef, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { useEditorStore } from '../../store/editorStore';
-import type { GeometryType } from '../../store/types';
+import type { GeometryType, SceneObject } from '../../store/types';
 import { engineRef } from '../../engine/engineRef';
 import { loadModelFile } from '../../engine/ModelLoader';
+import { exportGlb, exportObj, exportFbxFromMeshy } from '../../engine/ExportUtils';
 
 const primitives: { type: GeometryType; label: string }[] = [
   { type: 'box', label: 'Cube' },
@@ -90,6 +92,94 @@ function AddMenu() {
   );
 }
 
+function ExportMenu({ obj }: { obj: SceneObject }) {
+  const [open, setOpen] = useState(false);
+  const [menuPos, setMenuPos] = useState({ x: 0, y: 0 });
+  const [exporting, setExporting] = useState(false);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function close(e: MouseEvent) {
+      const clickedBtn = btnRef.current?.contains(e.target as Node);
+      const clickedMenu = menuRef.current?.contains(e.target as Node);
+      if (!clickedBtn && !clickedMenu) setOpen(false);
+    }
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, [open]);
+
+  function handleButtonClick(e: React.MouseEvent) {
+    e.stopPropagation();
+    if (!open && btnRef.current) {
+      const rect = btnRef.current.getBoundingClientRect();
+      setMenuPos({ x: rect.left, y: rect.bottom + 2 });
+    }
+    setOpen((o) => !o);
+  }
+
+  async function handleExport(format: 'glb' | 'obj' | 'fbx') {
+    setOpen(false);
+    setExporting(true);
+    try {
+      const sm = engineRef.current?.sceneManager;
+      if (!sm) return;
+      const mesh = sm.getMeshById(obj.id);
+      if (!mesh) return;
+
+      if (format === 'glb') {
+        const clips = sm.animationManager.getClips(obj.id);
+        await exportGlb(mesh, obj.name, clips);
+      } else if (format === 'obj') {
+        exportObj(mesh, obj.name);
+      } else if (format === 'fbx') {
+        if (!obj.meshyTaskId) return;
+        await exportFbxFromMeshy(obj.meshyTaskId, obj.name);
+      }
+    } catch (err) {
+      console.error('Export failed:', err);
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  const hasFbx = Boolean(obj.meshyTaskId);
+
+  return (
+    <div className="export-menu-wrap" onClick={(e) => e.stopPropagation()}>
+      <button
+        ref={btnRef}
+        className={`export-btn${exporting ? ' exporting' : ''}`}
+        onClick={handleButtonClick}
+        disabled={exporting}
+        title="Export mesh"
+      >
+        {exporting ? '…' : '⬇'}
+      </button>
+      {open && createPortal(
+        <div ref={menuRef} className="export-menu" style={{ left: menuPos.x, top: menuPos.y }}>
+          <div className="export-menu-label">Export as</div>
+          <button className="export-menu-item" onClick={() => handleExport('glb')}>
+            GLB <span className="export-fmt-note">+ animations</span>
+          </button>
+          <button className="export-menu-item" onClick={() => handleExport('obj')}>
+            OBJ
+          </button>
+          <button
+            className={`export-menu-item${!hasFbx ? ' disabled' : ''}`}
+            onClick={() => hasFbx && handleExport('fbx')}
+            title={!hasFbx ? 'FBX is available for Meshy-generated models' : 'Download FBX'}
+          >
+            FBX {!hasFbx && <span className="export-fmt-note">Meshy only</span>}
+          </button>
+        </div>,
+        document.body,
+      )}
+    </div>
+  );
+}
+
 export default function HierarchyPanel() {
   const objects = useEditorStore((s) => s.objects);
   const selectedIds = useEditorStore((s) => s.selectedIds);
@@ -160,6 +250,7 @@ export default function HierarchyPanel() {
             ) : (
               <span className="name">{obj.name}</span>
             )}
+            <ExportMenu obj={obj} />
           </div>
         ))}
       </div>
