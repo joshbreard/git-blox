@@ -33,9 +33,6 @@ import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
-import { execFile } from 'child_process';
-import * as fs from 'fs';
-import * as crypto from 'crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -57,42 +54,26 @@ function send(ws: WebSocket, data: object) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
 }
 
-function sendBinary(ws: WebSocket, buf: Buffer | Uint8Array) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(buf);
-}
 
-/** Buffer all TTS MP3 chunks and return the raw MP3 buffer and its base64 encoding. */
-async function bufferTTSToMp3(
-  source: AsyncIterable<Buffer>,
-): Promise<{ mp3Buffer: Buffer; base64: string }> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of source) {
-    chunks.push(chunk);
-  }
-  const mp3Buffer = Buffer.concat(chunks);
-  const base64 = mp3Buffer.toString('base64');
-  return { mp3Buffer, base64 };
-}
-
-/** Convert an MP3 buffer to a 16kHz mono WAV buffer (base64) via ffmpeg. */
-async function mp3ToWavBase64(mp3Buffer: Buffer): Promise<string> {
-  const tmpId = crypto.randomBytes(8).toString('hex');
-  const inputPath = path.join('/tmp', `a2f_in_${tmpId}.mp3`);
-  const outputPath = path.join('/tmp', `a2f_out_${tmpId}.wav`);
-  try {
-    await fs.promises.writeFile(inputPath, mp3Buffer);
-    await new Promise<void>((resolve, reject) => {
-      execFile('ffmpeg', ['-y', '-i', inputPath, '-ar', '16000', '-ac', '1', '-f', 'wav', outputPath], (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-    const wavBuffer = await fs.promises.readFile(outputPath);
-    return wavBuffer.toString('base64');
-  } finally {
-    await fs.promises.unlink(inputPath).catch(() => {});
-    await fs.promises.unlink(outputPath).catch(() => {});
-  }
+function pcmToWav(pcmBuffer: Buffer, sampleRate = 16000, channels = 1, bitsPerSample = 16): Buffer {
+  const byteRate = sampleRate * channels * (bitsPerSample / 8);
+  const blockAlign = channels * (bitsPerSample / 8);
+  const dataSize = pcmBuffer.length;
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(dataSize, 40);
+  return Buffer.concat([header, pcmBuffer]);
 }
 
 /**
@@ -115,7 +96,7 @@ async function* streamElevenLabsTTS(
     body: JSON.stringify({
       text,
       model_id: 'eleven_flash_v2_5',
-      output_format: 'mp3_44100_128',
+      output_format: 'pcm_16000',
     }),
   });
 
@@ -133,25 +114,19 @@ async function* streamElevenLabsTTS(
 }
 
 /**
- * Call NVIDIA Audio2Face-3D via gRPC on NVCF.
- *
- * Loads proto/a2f_nvcf.proto (NVCF cloud variant where PushAudioStream returns a
- * stream of AnimationDataStream rather than a single Status). Connects to
- * grpc.nvcf.nvidia.com:443 with TLS, sets authorization + function-id metadata,
- * then streams the WAV PCM in 4096-byte AudioWithEmotion chunks. Collects
- * blendshape names from the AnimationDataStreamHeader and float values from each
- * AnimationData frame, returning them as { timestamp, values } objects.
+ * Open a bidirectional A2F gRPC stream. Returns a live `call` object for writing
+ * PCM chunks and a `framesPromise` that resolves with all collected frames when
+ * the stream ends. Audio should be written as chunks arrive and `call.end()` called
+ * when done — A2F then processes in parallel with the rest of the pipeline.
  */
-async function fetchA2FBlendshapesOnce(
-  audioBase64: string,
+function openA2FCall(
   nvidiaApiKey: string,
   nvidiaFunctionId: string,
-): Promise<Array<{ timestamp: number; values: Record<string, number> }>> {
-  if (!nvidiaApiKey || !nvidiaFunctionId) return [];
-
-  console.log(`[A2F] WAV buffer byte length: ${Buffer.byteLength(audioBase64, 'base64')}`);
-  console.log(`[A2F] base64 preview (first 100 chars): ${audioBase64.slice(0, 100)}`);
-  console.log(`[A2F] functionId: ${nvidiaFunctionId}`);
+): { call: { write: (msg: unknown) => void; end: () => void }; framesPromise: Promise<Array<{ timestamp: number; values: Record<string, number> }>> } {
+  const noop = { write: () => {}, end: () => {} };
+  if (!nvidiaApiKey || !nvidiaFunctionId) {
+    return { call: noop, framesPromise: Promise.resolve([]) };
+  }
 
   try {
     const protoDir = path.resolve(__dirname, 'proto');
@@ -172,17 +147,12 @@ async function fetchA2FBlendshapesOnce(
     );
 
     const grpcObj = grpc.loadPackageDefinition(packageDef) as Record<string, unknown>;
-    console.log('[A2F] grpcObj top-level keys:', JSON.stringify(Object.keys(grpcObj)));
-
     const svc = (grpcObj as any)?.nvidia_ace?.services?.a2f_controller?.v1;
-    console.log('[A2F] Available service keys:', JSON.stringify(Object.keys(svc ?? {})));
     const A2FServiceClient = svc?.A2FControllerService;
     if (!A2FServiceClient) throw new Error('[A2F] A2FControllerService not found in loaded proto');
 
     const meta = new grpc.Metadata();
     meta.set('authorization', `Bearer ${nvidiaApiKey}`);
-    // NVCF gRPC routing header — 'nvcf-function-id' is the current standard;
-    // 'function-id' is kept as a fallback for older NVCF deployments.
     meta.set('nvcf-function-id', nvidiaFunctionId);
     meta.set('function-id', nvidiaFunctionId);
 
@@ -190,26 +160,21 @@ async function fetchA2FBlendshapesOnce(
       'grpc.nvcf.nvidia.com:443',
       grpc.credentials.createSsl(),
       {
-        'grpc.max_receive_message_length': 64 * 1024 * 1024, // 64 MB
+        'grpc.max_receive_message_length': 64 * 1024 * 1024,
         'grpc.max_send_message_length': 64 * 1024 * 1024,
       },
     );
 
-    console.log(`[A2F] Calling /nvidia_ace.services.a2f_controller.v1.A2FControllerService/ProcessAudioStream on grpc.nvcf.nvidia.com:443`);
+    const deadline = new Date(Date.now() + 30_000);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const call = (client as any).processAudioStream(meta, { deadline });
 
-    return new Promise((resolve) => {
+    const framesPromise = new Promise<Array<{ timestamp: number; values: Record<string, number> }>>((resolve) => {
       const blendshapeNames: string[] = [];
       const frames: Array<{ timestamp: number; values: Record<string, number> }> = [];
 
-      // Bidirectional stream: we send AudioStream messages, server sends AnimationDataStream.
-      // Set a deadline to accommodate NVCF cold-start worker provisioning.
-      const deadline = new Date(Date.now() + 30_000);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const call = (client as any).processAudioStream(meta, { deadline });
-
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       call.on('data', (msg: any) => {
-        // First response message: header containing blendshape names for the session.
         if (msg.animation_data_stream_header) {
           const names: string[] =
             msg.animation_data_stream_header?.skel_animation_header?.blend_shapes ?? [];
@@ -217,19 +182,16 @@ async function fetchA2FBlendshapesOnce(
           console.log(`[A2F] Header received — ${blendshapeNames.length} blendshape names`);
         }
 
-        // Subsequent messages: animation data with one or more blend_shape_weights frames.
         if (msg.animation_data?.skel_animation) {
           for (const bsw of msg.animation_data.skel_animation.blend_shape_weights ?? []) {
-            // bsw: FloatArrayWithTimeCode { time_code: number, values: number[] }
             const frameValues: Record<string, number> = {};
-            (bsw.values as number[]).forEach((weight, i) => {
+            (bsw.values as number[]).forEach((weight: number, i: number) => {
               if (blendshapeNames[i] !== undefined) frameValues[blendshapeNames[i]] = weight;
             });
             frames.push({ timestamp: bsw.time_code as number, values: frameValues });
           }
         }
 
-        // Status message (typically the last one in the stream).
         if (msg.status) {
           console.log(`[A2F] Status — code: ${msg.status.code} message: ${msg.status.message}`);
         }
@@ -244,58 +206,13 @@ async function fetchA2FBlendshapesOnce(
         console.warn(`[A2F] gRPC stream error: code=${err.code} message="${err.message}" details="${err.details ?? ''}"`);
         resolve([]);
       });
-
-      // ── Send audio ───────────────────────────────────────────────────────────
-
-      call.write({
-        audio_stream_header: {
-          audio_header: {
-            audio_format: 0,
-            channel_count: 1,
-            samples_per_second: 16000,
-            bits_per_sample: 16,
-          },
-        },
-      });
-
-      const wavBuf = Buffer.from(audioBase64, 'base64');
-      call.write({
-        audio_with_emotion: {
-          audio_buffer: wavBuf,
-        },
-      });
-
-      call.end();
     });
-  } catch (err) {
-    console.warn('[A2F] Error fetching blendshapes:', err);
-    return [];
-  }
-}
 
-/**
- * Retrying wrapper around fetchA2FBlendshapesOnce.
- * NVCF workers cold-start on the first request and can return DEADLINE_EXCEEDED
- * ("failed to establish link to worker") until the worker is ready. We retry
- * up to MAX_RETRIES times with a short delay to handle this gracefully.
- */
-async function fetchA2FBlendshapes(
-  audioBase64: string,
-  nvidiaApiKey: string,
-  nvidiaFunctionId: string,
-): Promise<Array<{ timestamp: number; values: Record<string, number> }>> {
-  const MAX_RETRIES = 2;
-  const RETRY_DELAY_MS = 3000;
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const result = await fetchA2FBlendshapesOnce(audioBase64, nvidiaApiKey, nvidiaFunctionId);
-    if (result.length > 0) return result;
-    if (attempt < MAX_RETRIES) {
-      console.log(`[A2F] No frames on attempt ${attempt}, retrying in ${RETRY_DELAY_MS}ms…`);
-      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
-    }
+    return { call, framesPromise };
+  } catch (err) {
+    console.warn('[A2F] Error opening A2F call:', err);
+    return { call: noop, framesPromise: Promise.resolve([]) };
   }
-  console.warn('[A2F] All retry attempts exhausted, returning empty frames.');
-  return [];
 }
 
 // ─── WebSocket session handler ────────────────────────────────────────────────
@@ -363,40 +280,48 @@ wss.on('connection', (ws: WebSocket) => {
         throw err;
       }
 
-      // TTS: buffer all MP3 audio
       console.log(`[ElevenLabs] Sending TTS for: "${fullResponse}"`);
-      let mp3Buffer: Buffer;
-      let audioBase64: string;
+      const pcmChunks: Buffer[] = [];
+
+      // Open A2F gRPC call before streaming starts so it's ready to receive
+      const { call, framesPromise } = openA2FCall(config.nvidiaApiKey, config.nvidiaFunctionId);
+      call.write({
+        audio_stream_header: {
+          audio_header: { audio_format: 0, channel_count: 1, samples_per_second: 16000, bits_per_sample: 16 },
+        },
+      });
+
+      // Stream PCM: tee to A2F gRPC and accumulate for WAV
+      let chunkIndex = 0;
       try {
-        ({ mp3Buffer, base64: audioBase64 } = await bufferTTSToMp3(
-          streamElevenLabsTTS(fullResponse, config.voiceId, config.elevenLabsKey),
-        ));
-        console.log(`[ElevenLabs] TTS complete, total bytes: ${mp3Buffer.length}`);
+        for await (const chunk of streamElevenLabsTTS(fullResponse, config.voiceId, config.elevenLabsKey)) {
+          pcmChunks.push(chunk);
+          call.write({ audio_with_emotion: { audio_buffer: chunk } });
+          if (chunkIndex % 10 === 0) console.log(`[A2F] Streaming PCM chunk: ${chunk.length} bytes`);
+          chunkIndex++;
+        }
       } catch (err: unknown) {
         console.error('[ElevenLabs] Error calling TTS:', err instanceof Error ? err.stack ?? err.message : err);
         throw err;
       }
+      call.end();
+      const pcmBuffer = Buffer.concat(pcmChunks);
+      console.log(`[ElevenLabs] TTS complete, total PCM bytes: ${pcmBuffer.length}`);
 
+      // Send audio to browser immediately — do NOT wait for A2F
+      const wavBuffer = pcmToWav(pcmBuffer);
+      const audioBase64 = wavBuffer.toString('base64');
       incomingAudioChunks.length = 0;
-
-      // Send MP3 audio immediately — do NOT block on A2F
       send(ws, { type: 'npc_response', audio: audioBase64, blendshapes: [], fps: 30 });
       send(ws, { type: 'response_end' });
 
-      // Run A2F in background; convert MP3→WAV then fetch blendshapes
-      if (config.nvidiaApiKey && config.nvidiaFunctionId) {
-        const capturedConfig = config;
-        const capturedMp3 = mp3Buffer;
-        const audioSentAt = Date.now();
-        mp3ToWavBase64(capturedMp3)
-          .then((wavBase64) => fetchA2FBlendshapes(wavBase64, capturedConfig.nvidiaApiKey, capturedConfig.nvidiaFunctionId))
-          .then((frames) => {
-            if (frames.length > 0) {
-              send(ws, { type: 'npc_blendshapes', frames, fps: 30, audioOffsetMs: Date.now() - audioSentAt });
-            }
-          })
-          .catch(() => { /* logged inside fetchA2FBlendshapes */ });
-      }
+      // A2F continues processing in background — send blendshapes when done
+      const audioSentAt = Date.now();
+      framesPromise.then((frames) => {
+        if (frames.length > 0) {
+          send(ws, { type: 'npc_blendshapes', frames, fps: 30, audioOffsetMs: Date.now() - audioSentAt });
+        }
+      }).catch(() => { /* logged inside openA2FCall */ });
     } catch (err: unknown) {
       console.error('[Session] Pipeline error:', err instanceof Error ? err.stack ?? err.message : err);
       send(ws, { type: 'error', message: err instanceof Error ? err.message : 'Response error' });
@@ -436,28 +361,40 @@ wss.on('connection', (ws: WebSocket) => {
       console.log(`[startConversation] Greeting: "${fullResponse}"`);
       send(ws, { type: 'response_start' });
 
-      const { mp3Buffer, base64: audioBase64 } = await bufferTTSToMp3(
-        streamElevenLabsTTS(fullResponse, config.voiceId, config.elevenLabsKey),
-      );
+      const scPcmChunks: Buffer[] = [];
 
-      // Send MP3 audio immediately — do NOT block on A2F
-      send(ws, { type: 'npc_response', audio: audioBase64, blendshapes: [], fps: 30 });
+      // Open A2F gRPC call before streaming starts so it's ready to receive
+      const { call: scCall, framesPromise: scFramesPromise } = openA2FCall(config.nvidiaApiKey, config.nvidiaFunctionId);
+      scCall.write({
+        audio_stream_header: {
+          audio_header: { audio_format: 0, channel_count: 1, samples_per_second: 16000, bits_per_sample: 16 },
+        },
+      });
+
+      // Stream PCM: tee to A2F gRPC and accumulate for WAV
+      let scChunkIndex = 0;
+      for await (const chunk of streamElevenLabsTTS(fullResponse, config.voiceId, config.elevenLabsKey)) {
+        scPcmChunks.push(chunk);
+        scCall.write({ audio_with_emotion: { audio_buffer: chunk } });
+        if (scChunkIndex % 10 === 0) console.log(`[A2F] Streaming PCM chunk: ${chunk.length} bytes`);
+        scChunkIndex++;
+      }
+      scCall.end();
+      const scPcmBuffer = Buffer.concat(scPcmChunks);
+
+      // Send audio to browser immediately — do NOT wait for A2F
+      const scWavBuffer = pcmToWav(scPcmBuffer);
+      const scAudioBase64 = scWavBuffer.toString('base64');
+      send(ws, { type: 'npc_response', audio: scAudioBase64, blendshapes: [], fps: 30 });
       send(ws, { type: 'response_end' });
 
-      // Run A2F in background; convert MP3→WAV then fetch blendshapes
-      if (config.nvidiaApiKey && config.nvidiaFunctionId) {
-        const capturedConfig = config;
-        const capturedMp3 = mp3Buffer;
-        const audioSentAt = Date.now();
-        mp3ToWavBase64(capturedMp3)
-          .then((wavBase64) => fetchA2FBlendshapes(wavBase64, capturedConfig.nvidiaApiKey, capturedConfig.nvidiaFunctionId))
-          .then((frames) => {
-            if (frames.length > 0) {
-              send(ws, { type: 'npc_blendshapes', frames, fps: 30, audioOffsetMs: Date.now() - audioSentAt });
-            }
-          })
-          .catch(() => { /* logged inside fetchA2FBlendshapes */ });
-      }
+      // A2F continues processing in background — send blendshapes when done
+      const scAudioSentAt = Date.now();
+      scFramesPromise.then((frames) => {
+        if (frames.length > 0) {
+          send(ws, { type: 'npc_blendshapes', frames, fps: 30, audioOffsetMs: Date.now() - scAudioSentAt });
+        }
+      }).catch(() => { /* logged inside openA2FCall */ });
     } catch (err: unknown) {
       console.error('[startConversation] Error:', err instanceof Error ? err.message : err);
       send(ws, { type: 'error', message: err instanceof Error ? err.message : 'Greeting error' });

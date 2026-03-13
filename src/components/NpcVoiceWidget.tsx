@@ -258,7 +258,10 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
                 break;
               }
 
-              const elapsedMs = performance.now() - audioStartMsRef.current;
+              const audioOffsetMs = (msg.audioOffsetMs as number) ?? 0;
+              const elapsedMs = audioOffsetMs > 0
+                ? audioOffsetMs
+                : performance.now() - audioStartMsRef.current;
               const totalDurationMs = (frames.length / fps) * 1000;
               // If A2F arrived after the audio already finished, replay from frame 0.
               // Without this guard startFrameIdx is clamped to frames.length-1 and
