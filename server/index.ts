@@ -56,9 +56,12 @@ function send(ws: WebSocket, data: object) {
 
 
 function pcmToWav(pcmBuffer: Buffer, sampleRate = 16000, channels = 1, bitsPerSample = 16): Buffer {
+  const buf = pcmBuffer.length % 2 === 0
+    ? pcmBuffer
+    : pcmBuffer.subarray(0, pcmBuffer.length - 1);
   const byteRate = sampleRate * channels * (bitsPerSample / 8);
   const blockAlign = channels * (bitsPerSample / 8);
-  const dataSize = pcmBuffer.length;
+  const dataSize = buf.length;
   const header = Buffer.alloc(44);
   header.write('RIFF', 0);
   header.writeUInt32LE(36 + dataSize, 4);
@@ -73,7 +76,7 @@ function pcmToWav(pcmBuffer: Buffer, sampleRate = 16000, channels = 1, bitsPerSa
   header.writeUInt16LE(bitsPerSample, 34);
   header.write('data', 36);
   header.writeUInt32LE(dataSize, 40);
-  return Buffer.concat([header, pcmBuffer]);
+  return Buffer.concat([header, buf]);
 }
 
 /**
@@ -106,10 +109,28 @@ async function* streamElevenLabsTTS(
   }
 
   const reader = res.body.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) yield Buffer.from(value);
+  try {
+    const MIN_CHUNK = 4096;
+    let pending = Buffer.alloc(0);
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        if (pending.length > 0) yield pending;
+        break;
+      }
+      if (value) {
+        pending = Buffer.concat([pending, Buffer.from(value)]);
+        while (pending.length >= MIN_CHUNK) {
+          yield pending.subarray(0, MIN_CHUNK);
+          pending = pending.subarray(MIN_CHUNK);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[ElevenLabs] Stream read error:', err);
+    throw err;
+  } finally {
+    reader.releaseLock();
   }
 }
 
@@ -306,7 +327,7 @@ wss.on('connection', (ws: WebSocket) => {
       }
       call.end();
       const pcmBuffer = Buffer.concat(pcmChunks);
-      console.log(`[ElevenLabs] TTS complete, total PCM bytes: ${pcmBuffer.length}`);
+      console.log(`[ElevenLabs] TTS complete, total PCM bytes: ${pcmBuffer.length}, chunks: ${chunkIndex}`);
 
       // Send audio to browser immediately — do NOT wait for A2F
       const wavBuffer = pcmToWav(pcmBuffer);
@@ -381,6 +402,7 @@ wss.on('connection', (ws: WebSocket) => {
       }
       scCall.end();
       const scPcmBuffer = Buffer.concat(scPcmChunks);
+      console.log(`[ElevenLabs] TTS complete, total PCM bytes: ${scPcmBuffer.length}, chunks: ${scChunkIndex}`);
 
       // Send audio to browser immediately — do NOT wait for A2F
       const scWavBuffer = pcmToWav(scPcmBuffer);
