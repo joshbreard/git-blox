@@ -33,7 +33,9 @@ function resolveBlendshapeIndex(
 ): number {
   const dict = mesh.morphTargetDictionary;
   if (!dict) return -1;
-  const candidates = ((arkitMap as unknown) as Record<string, string[]>)[arkitKey] ?? [];
+  // A2F returns PascalCase names (e.g. "JawOpen"); ARKit map uses camelCase ("jawOpen") — normalize
+  const normalizedKey = arkitKey.charAt(0).toLowerCase() + arkitKey.slice(1);
+  const candidates = ((arkitMap as unknown) as Record<string, string[]>)[normalizedKey] ?? [];
   for (const name of candidates) {
     if (name in dict) return dict[name];
   }
@@ -72,6 +74,7 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
 
   const blendshapeIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const morphMeshRef = useRef<THREE.Mesh | null>(null);
+  const audioStartMsRef = useRef<number>(0);
 
   const isActive = status !== 'idle' && status !== 'error';
 
@@ -177,19 +180,24 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
               const frames = msg.blendshapes as BlendshapeFrame[];
               const fps = (msg.fps as number) ?? 30;
 
+              // Record when audio starts so blendshapes arriving later can sync
+              audioStartMsRef.current = performance.now();
+
               // Decode base64 WAV → ArrayBuffer and play
               const bytes = Uint8Array.from(atob(audioB64), (c) => c.charCodeAt(0));
               const ctx = audioCtxRef.current;
               if (ctx) {
-                ctx.decodeAudioData(bytes.buffer.slice(0)).then((decoded) => {
-                  const src = ctx.createBufferSource();
-                  src.buffer = decoded;
-                  src.connect(ctx.destination);
-                  src.start(ctx.currentTime);
-                }).catch(() => { /* non-fatal */ });
+                ctx.resume().then(() => {
+                  ctx.decodeAudioData(bytes.buffer.slice(0)).then((decoded) => {
+                    const src = ctx.createBufferSource();
+                    src.buffer = decoded;
+                    src.connect(ctx.destination);
+                    src.start(ctx.currentTime);
+                  }).catch((err) => { console.error('[Audio] decodeAudioData failed:', err); });
+                }).catch((err) => { console.error('[Audio] AudioContext resume failed:', err); });
               }
 
-              // Drive blendshapes at fps via setInterval
+              // Drive blendshapes inline only if server sent them with the audio (warm A2F path)
               if (blendshapeIntervalRef.current) clearInterval(blendshapeIntervalRef.current);
               const mesh = morphMeshRef.current;
               if (mesh && frames.length > 0) {
@@ -208,6 +216,37 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
                   }
                 }, 1000 / fps);
               }
+              break;
+            }
+
+            case 'npc_blendshapes': {
+              // A2F completed after audio was already sent — sync animation to elapsed playback time
+              const frames = msg.frames as BlendshapeFrame[];
+              const fps = (msg.fps as number) ?? 30;
+              const mesh = morphMeshRef.current;
+              if (!mesh || frames.length === 0) break;
+
+              const elapsedMs = performance.now() - audioStartMsRef.current;
+              const startFrameIdx = Math.min(
+                Math.floor(elapsedMs / (1000 / fps)),
+                frames.length - 1,
+              );
+
+              if (blendshapeIntervalRef.current) clearInterval(blendshapeIntervalRef.current);
+              let frameIdx = Math.max(0, startFrameIdx);
+              blendshapeIntervalRef.current = setInterval(() => {
+                if (frameIdx >= frames.length) {
+                  clearInterval(blendshapeIntervalRef.current!);
+                  blendshapeIntervalRef.current = null;
+                  return;
+                }
+                const frame = frames[frameIdx++];
+                if (!mesh.morphTargetInfluences || !mesh.morphTargetDictionary) return;
+                for (const [arkitKey, weight] of Object.entries(frame.values)) {
+                  const idx = resolveBlendshapeIndex(mesh, arkitKey);
+                  if (idx >= 0) mesh.morphTargetInfluences[idx] = weight;
+                }
+              }, 1000 / fps);
               break;
             }
             case 'response_end':
