@@ -42,6 +42,27 @@ function resolveBlendshapeIndex(
   return -1;
 }
 
+/** Parse a WAV buffer and return the byte offset where the PCM data chunk begins.
+ *  Scans RIFF sub-chunks for the "data" fourCC. Falls back to 44 if not found. */
+function findWavDataOffset(bytes: Uint8Array): number {
+  // Minimum valid RIFF header is 12 bytes ("RIFF" + size + "WAVE")
+  if (bytes.length < 12) return 44;
+  const dec = new TextDecoder('ascii');
+  const riff = dec.decode(bytes.slice(0, 4));
+  const wave = dec.decode(bytes.slice(8, 12));
+  if (riff !== 'RIFF' || wave !== 'WAVE') return 44;
+  let offset = 12;
+  while (offset + 8 <= bytes.length) {
+    const id = dec.decode(bytes.slice(offset, offset + 4));
+    const chunkSize = new DataView(bytes.buffer, bytes.byteOffset + offset + 4, 4).getUint32(0, true);
+    offset += 8;
+    if (id === 'data') return offset;
+    // Chunks are word-aligned — advance by chunkSize rounded up to even
+    offset += chunkSize + (chunkSize & 1);
+  }
+  return 44;
+}
+
 /** Find the first SkinnedMesh descendant of an Object3D that has morph targets. */
 function findMorphMesh(root: THREE.Object3D): THREE.Mesh | null {
   let found: THREE.Mesh | null = null;
@@ -67,6 +88,7 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const playbackCtxRef = useRef<AudioContext | null>(null);
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -92,6 +114,8 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
     streamRef.current = null;
     audioCtxRef.current?.close().catch(() => {});
     audioCtxRef.current = null;
+    playbackCtxRef.current?.close().catch(() => {});
+    playbackCtxRef.current = null;
     wsRef.current?.close();
     wsRef.current = null;
     listeningRef.current = false;
@@ -151,13 +175,21 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
       await audioCtx.resume();
       audioCtxRef.current = audioCtx;
 
+      // Separate AudioContext for NPC audio playback — created and resumed here
+      // inside the user gesture so it is guaranteed to be in "running" state
+      // when npc_response arrives. Reusing a single context avoids the
+      // create/close churn per response that causes CoreAudio pops and static.
+      const playbackCtx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
+      await playbackCtx.resume();
+      playbackCtxRef.current = playbackCtx;
+
       const micSource = audioCtx.createMediaStreamSource(stream);
       micSourceRef.current = micSource;
 
       const processor = audioCtx.createScriptProcessor(SCRIPT_PROC_BUFFER, 1, 1);
       processorRef.current = processor;
       micSource.connect(processor);
-      processor.connect(audioCtx.destination);
+      processor.connect(audioCtx.createGain());
 
       // ── WebSocket ─────────────────────────────────────────────────────────
       const ws = new WebSocket(WS_URL);
@@ -206,15 +238,14 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
               // Instead, manually parse the known format: 44-byte header, 16kHz,
               // mono, Int16 little-endian PCM.
               const bytes = Uint8Array.from(atob(audioB64), (c) => c.charCodeAt(0));
-              console.log('[Audio] Received WAV, byte length:', bytes.length,
-                'AudioContext state:', audioCtxRef.current?.state);
-              const ctx = audioCtxRef.current;
-              if (ctx) {
+              console.log('[Audio] Received WAV, byte length:', bytes.length);
+              const playCtx = playbackCtxRef.current;
+              if (playCtx) {
                 try {
-                  const WAV_HEADER = 44;
+                  const WAV_HEADER = findWavDataOffset(bytes);
                   const pcmBytes = bytes.length - WAV_HEADER;
                   const numSamples = Math.floor(pcmBytes / 2);
-                  const audioBuffer = ctx.createBuffer(1, numSamples, TARGET_SAMPLE_RATE);
+                  const audioBuffer = playCtx.createBuffer(1, numSamples, TARGET_SAMPLE_RATE);
                   const channelData = audioBuffer.getChannelData(0);
                   const view = new DataView(bytes.buffer, bytes.byteOffset + WAV_HEADER);
                   for (let i = 0; i < numSamples; i++) {
@@ -222,15 +253,15 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
                   }
                   console.log('[Audio] PCM decoded — samples:', numSamples,
                     'duration:', audioBuffer.duration.toFixed(2), 's');
-                  const src = ctx.createBufferSource();
+                  const src = playCtx.createBufferSource();
                   src.buffer = audioBuffer;
-                  src.connect(ctx.destination);
-                  src.start(ctx.currentTime);
+                  src.connect(playCtx.destination);
+                  src.start(playCtx.currentTime);
                 } catch (err) {
                   console.error('[Audio] PCM decode failed:', err);
                 }
               } else {
-                console.error('[Audio] AudioContext is null — cannot play');
+                console.error('[Audio] Playback AudioContext is null — cannot play');
               }
 
               // Drive blendshapes inline only if server sent them with the audio (warm A2F path)
