@@ -79,9 +79,7 @@ export async function loadModelFile(file: File): Promise<LoadedModel> {
   if (height > 0.001) {
     const s = TARGET_HEIGHT / height;
     merged.scale(s, s, s);
-    if (animations.length > 0 && root) {
-      root.scale.multiplyScalar(s);
-    }
+    root.scale.multiplyScalar(s);
   }
   merged.computeBoundingSphere();
 
@@ -89,6 +87,6 @@ export async function loadModelFile(file: File): Promise<LoadedModel> {
     name,
     geometry: merged,
     animations,
-    scene: animations.length > 0 ? root : null,
+    scene: root,
   };
 }
