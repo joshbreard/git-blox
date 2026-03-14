@@ -294,6 +294,7 @@ wss.on('connection', (ws: WebSocket) => {
   let processingUtterance = false;
   let lastAudioReceivedMs = 0;
   let firstSegmentMs = 0;
+  let lastSegmentConfidence = 0;
 
   async function handleTranscript(transcript: string) {
     if (isSpeaking) return;
@@ -504,8 +505,8 @@ wss.on('connection', (ws: WebSocket) => {
       smart_format: true,
       punctuate: true,
       interim_results: true,
-      endpointing: 300,
-      utterance_end_ms: 1000,
+      endpointing: 200,
+      no_delay: true,
       vad_events: true,
       encoding: 'linear16',
       sample_rate: 16000,
@@ -545,6 +546,7 @@ wss.on('connection', (ws: WebSocket) => {
           console.log(`[PERF-DG] First is_final segment — ${Date.now() - lastAudioReceivedMs}ms after last audio chunk`);
         }
         currentTranscript += (currentTranscript ? ' ' : '') + t;
+        lastSegmentConfidence = confidence;
         console.log(`[Deepgram] Segment final — confidence:${confidence.toFixed(3)} transcript:"${t}" accumulated:"${currentTranscript}"`);
       }
 
@@ -553,27 +555,17 @@ wss.on('connection', (ws: WebSocket) => {
         const toSend = currentTranscript.trim();
         currentTranscript = '';
         if (!toSend) return;
-        if (confidence < 0.5) {
-          console.log(`[Deepgram] speech_final but low confidence (${confidence.toFixed(3)}) — skipping`);
+        if (lastSegmentConfidence < 0.5) {
+          console.log(`[Deepgram] speech_final but low confidence (${lastSegmentConfidence.toFixed(3)}) — skipping`);
           return;
         }
         console.log(`[PERF-DG] speech_final fired — ${Date.now() - firstSegmentMs}ms after first segment, ${Date.now() - lastAudioReceivedMs}ms after last audio`);
         firstSegmentMs = 0;
+        lastSegmentConfidence = 0;
         console.log(`[Deepgram] Utterance complete — sending: "${toSend}"`);
         processingUtterance = true;
         handleTranscript(toSend).finally(() => { processingUtterance = false; });
       }
-    });
-    socket.on('UtteranceEnd', () => {
-      if (isSpeaking || processingUtterance) return;
-      const toSend = currentTranscript.trim();
-      if (!toSend) return;
-      currentTranscript = '';
-      console.log(`[PERF-DG] UtteranceEnd fired — ${Date.now() - firstSegmentMs}ms after first segment, ${Date.now() - lastAudioReceivedMs}ms after last audio`);
-      firstSegmentMs = 0;
-      console.log(`[Deepgram] UtteranceEnd fallback — sending: "${toSend}"`);
-      processingUtterance = true;
-      handleTranscript(toSend).finally(() => { processingUtterance = false; });
     });
   }
 
@@ -617,10 +609,12 @@ wss.on('connection', (ws: WebSocket) => {
     if (isBinary) {
       lastAudioReceivedMs = Date.now();
       incomingAudioChunks.push(Buffer.from(data));
-      if (deepgramSocket && deepgramReady) {
-        deepgramSocket.send(data);
-      } else if (deepgramSocket) {
-        pendingAudioBuffer.push(Buffer.from(data));
+      if (!isSpeaking) {
+        if (deepgramSocket && deepgramReady) {
+          deepgramSocket.send(data);
+        } else if (deepgramSocket) {
+          pendingAudioBuffer.push(Buffer.from(data));
+        }
       }
     }
   });
