@@ -426,8 +426,8 @@ wss.on('connection', (ws: WebSocket) => {
       console.error('[Session] Pipeline error:', err instanceof Error ? err.stack ?? err.message : err);
       send(ws, { type: 'error', message: err instanceof Error ? err.message : 'Response error' });
     } finally {
-      try { reconnectDeepgram(); } catch (err) { console.error('[Deepgram] Reconnect failed:', err); }
       isSpeaking = false;
+      // Do NOT reconnect Deepgram here — client will signal when playback ends
     }
   }
 
@@ -535,8 +535,8 @@ wss.on('connection', (ws: WebSocket) => {
       console.error('[startConversation] Error:', err instanceof Error ? err.message : err);
       send(ws, { type: 'error', message: err instanceof Error ? err.message : 'Greeting error' });
     } finally {
-      try { reconnectDeepgram(); } catch (err) { console.error('[Deepgram] Reconnect failed:', err); }
       isSpeaking = false;
+      // Do NOT reconnect Deepgram here — client will signal when playback ends
     }
   }
 
@@ -655,6 +655,19 @@ wss.on('connection', (ws: WebSocket) => {
       } catch {
         send(ws, { type: 'error', message: 'Invalid init message' });
       }
+      return;
+    }
+
+    // JSON control messages from client
+    if (!isBinary) {
+      try {
+        const parsed = JSON.parse(data.toString()) as { type?: string };
+        if (parsed.type === 'playback_complete') {
+          console.log('[WS] Playback complete — reconnecting Deepgram');
+          try { reconnectDeepgram(); } catch (err) { console.error('[Deepgram] Reconnect failed:', err); }
+          return;
+        }
+      } catch { /* ignore parse errors */ }
       return;
     }
 

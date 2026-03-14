@@ -219,19 +219,26 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
               const u8 = Uint8Array.from(atob(audio), c => c.charCodeAt(0));
               const arrayBuf = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
 
+              const reservedStart = Math.max(ctx.currentTime + 0.05, nextStartTimeRef.current);
+              nextStartTimeRef.current = reservedStart + 5; // reserve 5s slot, will shrink after decode
+
               ctx.decodeAudioData(arrayBuf as ArrayBuffer).then(audioBuf => {
-                const now = ctx.currentTime;
-                const startTime = nextStartTimeRef.current > now + 0.05
-                  ? nextStartTimeRef.current
-                  : now + 0.05;
-                nextStartTimeRef.current = startTime + audioBuf.duration;
+                // Update nextStartTimeRef with actual duration now that we know it
+                const actualEnd = reservedStart + audioBuf.duration;
+                if (nextStartTimeRef.current === reservedStart + 5) {
+                  // Only update if no newer sentence has already claimed this slot
+                  nextStartTimeRef.current = actualEnd;
+                } else {
+                  // A later sentence already reserved; don't shrink their slot
+                  nextStartTimeRef.current = Math.max(nextStartTimeRef.current, actualEnd);
+                }
 
                 const src = ctx.createBufferSource();
                 src.buffer = audioBuf;
                 src.connect(ctx.destination);
-                src.start(startTime);
+                src.start(reservedStart);
 
-                console.log(`[PERF-CLIENT] Sentence scheduled at ${startTime.toFixed(2)}s, duration: ${audioBuf.duration.toFixed(2)}s`);
+                console.log(`[PERF-CLIENT] Sentence scheduled at ${reservedStart.toFixed(2)}s, duration: ${audioBuf.duration.toFixed(2)}s`);
               }).catch(err => console.error('[Audio] decodeAudioData failed:', err));
               break;
             }
@@ -279,11 +286,22 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
               }, 1000 / fps);
               break;
             }
-            case 'response_end':
-              nextStartTimeRef.current = 0;
-              listeningRef.current = true;
-              setStatus('listening');
+            case 'response_end': {
+              const ctx = playbackCtxRef.current;
+              const msRemaining = ctx && nextStartTimeRef.current > ctx.currentTime
+                ? (nextStartTimeRef.current - ctx.currentTime) * 1000
+                : 0;
+              setTimeout(() => {
+                if (wsRef.current?.readyState === WebSocket.OPEN) {
+                  wsRef.current.send(JSON.stringify({ type: 'playback_complete' }));
+                  console.log('[CLIENT] playback_complete sent to server');
+                }
+                nextStartTimeRef.current = 0;
+                listeningRef.current = true;
+                setStatus('listening');
+              }, msRemaining + 200);
               break;
+            }
             case 'error':
               setErrorMsg(String(msg.message ?? 'Server error'));
               setStatus('error');
