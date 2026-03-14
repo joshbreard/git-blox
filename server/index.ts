@@ -16,7 +16,7 @@
  *   Server → Client:
  *     JSON:   { type:'transcript', text }
  *     JSON:   { type:'response_start' }
- *     JSON:   { type:'npc_response', audio:string (base64 WAV), blendshapes:Array<{timestamp,values}>, fps:30 }
+ *     JSON:   { type:'npc_response', audio:string (base64 MP3), blendshapes:Array<{timestamp,values}>, fps:30 }
  *     JSON:   { type:'response_end' }
  *     JSON:   { type:'error', message }
  */
@@ -54,39 +54,16 @@ function send(ws: WebSocket, data: object) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
 }
 
-
-function pcmToWav(pcmBuffer: Buffer, sampleRate = 16000, channels = 1, bitsPerSample = 16): Buffer {
-  const buf = pcmBuffer.length % 2 === 0
-    ? pcmBuffer
-    : pcmBuffer.subarray(0, pcmBuffer.length - 1);
-  const byteRate = sampleRate * channels * (bitsPerSample / 8);
-  const blockAlign = channels * (bitsPerSample / 8);
-  const dataSize = buf.length;
-  const header = Buffer.alloc(44);
-  header.write('RIFF', 0);
-  header.writeUInt32LE(36 + dataSize, 4);
-  header.write('WAVE', 8);
-  header.write('fmt ', 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(channels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(bitsPerSample, 34);
-  header.write('data', 36);
-  header.writeUInt32LE(dataSize, 40);
-  return Buffer.concat([header, buf]);
-}
-
 /**
- * Stream text to ElevenLabs websocket TTS.
- * Returns async generator of raw MP3 audio chunks.
+ * Stream text to ElevenLabs TTS.
+ * outputFormat: 'mp3_44100_128' for browser playback, 'pcm_16000' for A2F gRPC.
+ * Returns async generator of audio chunks in the requested format.
  */
 async function* streamElevenLabsTTS(
   text: string,
   voiceId: string,
   apiKey: string,
+  outputFormat: 'mp3_44100_128' | 'pcm_16000' = 'mp3_44100_128',
 ): AsyncGenerator<Buffer> {
   if (!voiceId) throw new Error('ElevenLabs voiceId is required but was not provided in session config');
   const url = `${ELEVENLABS_BASE}/v1/text-to-speech/${voiceId}/stream`;
@@ -99,7 +76,7 @@ async function* streamElevenLabsTTS(
     body: JSON.stringify({
       text,
       model_id: 'eleven_flash_v2_5',
-      output_format: 'pcm_16000',
+      output_format: outputFormat,
     }),
   });
 
@@ -302,7 +279,6 @@ wss.on('connection', (ws: WebSocket) => {
       }
 
       console.log(`[ElevenLabs] Sending TTS for: "${fullResponse}"`);
-      const pcmChunks: Buffer[] = [];
 
       // Open A2F gRPC call before streaming starts so it's ready to receive
       const { call, framesPromise } = openA2FCall(config.nvidiaApiKey, config.nvidiaFunctionId);
@@ -312,28 +288,37 @@ wss.on('connection', (ws: WebSocket) => {
         },
       });
 
-      // Stream PCM: tee to A2F gRPC and accumulate for WAV
-      let chunkIndex = 0;
-      try {
-        for await (const chunk of streamElevenLabsTTS(fullResponse, config.voiceId, config.elevenLabsKey)) {
-          pcmChunks.push(chunk);
-          call.write({ audio_with_emotion: { audio_buffer: chunk } });
-          if (chunkIndex % 10 === 0) console.log(`[A2F] Streaming PCM chunk: ${chunk.length} bytes`);
-          chunkIndex++;
-        }
-      } catch (err: unknown) {
-        console.error('[ElevenLabs] Error calling TTS:', err instanceof Error ? err.stack ?? err.message : err);
-        throw err;
-      }
-      call.end();
-      const pcmBuffer = Buffer.concat(pcmChunks);
-      console.log('[PCM] First 4 bytes (hex):', pcmBuffer.slice(0, 4).toString('hex'));
-      console.log('[PCM] First 4 bytes (ascii):', pcmBuffer.slice(0, 4).toString('ascii'));
-      console.log(`[ElevenLabs] TTS complete, total PCM bytes: ${pcmBuffer.length}, chunks: ${chunkIndex}`);
+      // Two parallel ElevenLabs calls:
+      //   1. mp3_44100_128 — accumulate full MP3 for browser playback
+      //   2. pcm_16000     — stream raw PCM chunks to A2F gRPC
+      const [mp3Buffer] = await Promise.all([
+        (async () => {
+          const chunks: Buffer[] = [];
+          for await (const chunk of streamElevenLabsTTS(fullResponse, config!.voiceId, config!.elevenLabsKey, 'mp3_44100_128')) {
+            chunks.push(chunk);
+          }
+          const buf = Buffer.concat(chunks);
+          console.log(`[ElevenLabs] MP3 TTS complete, total bytes: ${buf.length}`);
+          return buf;
+        })(),
+        (async () => {
+          let idx = 0;
+          try {
+            for await (const chunk of streamElevenLabsTTS(fullResponse, config!.voiceId, config!.elevenLabsKey, 'pcm_16000')) {
+              call.write({ audio_with_emotion: { audio_buffer: chunk } });
+              if (idx % 10 === 0) console.log(`[A2F] Streaming PCM chunk: ${chunk.length} bytes`);
+              idx++;
+            }
+          } catch (err: unknown) {
+            console.error('[ElevenLabs] PCM stream error:', err instanceof Error ? err.message : err);
+          }
+          call.end();
+          console.log(`[ElevenLabs] PCM TTS complete, chunks: ${idx}`);
+        })(),
+      ]);
 
-      // Send audio to browser immediately — do NOT wait for A2F
-      const wavBuffer = pcmToWav(pcmBuffer);
-      const audioBase64 = wavBuffer.toString('base64');
+      // Send MP3 audio to browser immediately — do NOT wait for A2F
+      const audioBase64 = mp3Buffer.toString('base64');
       incomingAudioChunks.length = 0;
       send(ws, { type: 'npc_response', audio: audioBase64, blendshapes: [], fps: 30 });
       send(ws, { type: 'response_end' });
@@ -384,8 +369,6 @@ wss.on('connection', (ws: WebSocket) => {
       console.log(`[startConversation] Greeting: "${fullResponse}"`);
       send(ws, { type: 'response_start' });
 
-      const scPcmChunks: Buffer[] = [];
-
       // Open A2F gRPC call before streaming starts so it's ready to receive
       const { call: scCall, framesPromise: scFramesPromise } = openA2FCall(config.nvidiaApiKey, config.nvidiaFunctionId);
       scCall.write({
@@ -394,23 +377,37 @@ wss.on('connection', (ws: WebSocket) => {
         },
       });
 
-      // Stream PCM: tee to A2F gRPC and accumulate for WAV
-      let scChunkIndex = 0;
-      for await (const chunk of streamElevenLabsTTS(fullResponse, config.voiceId, config.elevenLabsKey)) {
-        scPcmChunks.push(chunk);
-        scCall.write({ audio_with_emotion: { audio_buffer: chunk } });
-        if (scChunkIndex % 10 === 0) console.log(`[A2F] Streaming PCM chunk: ${chunk.length} bytes`);
-        scChunkIndex++;
-      }
-      scCall.end();
-      const scPcmBuffer = Buffer.concat(scPcmChunks);
-      console.log('[PCM] First 4 bytes (hex):', scPcmBuffer.slice(0, 4).toString('hex'));
-      console.log('[PCM] First 4 bytes (ascii):', scPcmBuffer.slice(0, 4).toString('ascii'));
-      console.log(`[ElevenLabs] TTS complete, total PCM bytes: ${scPcmBuffer.length}, chunks: ${scChunkIndex}`);
+      // Two parallel ElevenLabs calls:
+      //   1. mp3_44100_128 — accumulate full MP3 for browser playback
+      //   2. pcm_16000     — stream raw PCM chunks to A2F gRPC
+      const [scMp3Buffer] = await Promise.all([
+        (async () => {
+          const chunks: Buffer[] = [];
+          for await (const chunk of streamElevenLabsTTS(fullResponse, config!.voiceId, config!.elevenLabsKey, 'mp3_44100_128')) {
+            chunks.push(chunk);
+          }
+          const buf = Buffer.concat(chunks);
+          console.log(`[ElevenLabs] MP3 TTS complete, total bytes: ${buf.length}`);
+          return buf;
+        })(),
+        (async () => {
+          let idx = 0;
+          try {
+            for await (const chunk of streamElevenLabsTTS(fullResponse, config!.voiceId, config!.elevenLabsKey, 'pcm_16000')) {
+              scCall.write({ audio_with_emotion: { audio_buffer: chunk } });
+              if (idx % 10 === 0) console.log(`[A2F] Streaming PCM chunk: ${chunk.length} bytes`);
+              idx++;
+            }
+          } catch (err: unknown) {
+            console.error('[ElevenLabs] PCM stream error:', err instanceof Error ? err.message : err);
+          }
+          scCall.end();
+          console.log(`[ElevenLabs] PCM TTS complete, chunks: ${idx}`);
+        })(),
+      ]);
 
-      // Send audio to browser immediately — do NOT wait for A2F
-      const scWavBuffer = pcmToWav(scPcmBuffer);
-      const scAudioBase64 = scWavBuffer.toString('base64');
+      // Send MP3 audio to browser immediately — do NOT wait for A2F
+      const scAudioBase64 = scMp3Buffer.toString('base64');
       send(ws, { type: 'npc_response', audio: scAudioBase64, blendshapes: [], fps: 30 });
       send(ws, { type: 'response_end' });
 
