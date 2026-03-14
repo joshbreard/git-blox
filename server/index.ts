@@ -476,7 +476,9 @@ wss.on('connection', (ws: WebSocket) => {
       smart_format: true,
       punctuate: true,
       interim_results: true,
-      endpointing: 400,
+      endpointing: 300,
+      utterance_end_ms: 1000,
+      vad_events: true,
       encoding: 'linear16',
       sample_rate: 16000,
     });
@@ -505,34 +507,35 @@ wss.on('connection', (ws: WebSocket) => {
       const alt = msg.channel?.alternatives?.[0];
       if (!alt) return;
 
-      const t = alt.transcript ?? '';
+      const t = (alt.transcript ?? '').trim();
       const confidence = alt.confidence ?? 0;
-      console.log(`[Deepgram] Result — is_final:${msg.is_final} speech_final:${msg.speech_final} confidence:${confidence.toFixed(3)} transcript:"${t}"`);
 
-      // Accumulate intermediate finals; only trigger on a fully-closed utterance.
-      if (!msg.is_final || !msg.speech_final) {
-        if (msg.is_final) {
-          currentTranscript += (currentTranscript ? ' ' : '') + t;
-        }
-        return;
+      // Accumulate is_final segments (not speech_final yet)
+      if (msg.is_final && t) {
+        currentTranscript += (currentTranscript ? ' ' : '') + t;
+        console.log(`[Deepgram] Segment final — confidence:${confidence.toFixed(3)} transcript:"${t}" accumulated:"${currentTranscript}"`);
       }
 
-      // Guard 1: both is_final and speech_final must be true (already enforced above).
-      // Guard 2: skip low-confidence results.
-      if (confidence < 0.5) {
-        console.log(`[Deepgram] Low confidence (${confidence.toFixed(3)}) — skipping`);
+      // Only fire when speech_final=true AND we have accumulated text with good confidence
+      if (msg.speech_final) {
+        const toSend = currentTranscript.trim();
         currentTranscript = '';
-        return;
+        if (!toSend) return;
+        if (confidence < 0.5) {
+          console.log(`[Deepgram] speech_final but low confidence (${confidence.toFixed(3)}) — skipping`);
+          return;
+        }
+        console.log(`[Deepgram] Utterance complete — sending: "${toSend}"`);
+        processingUtterance = true;
+        handleTranscript(toSend).finally(() => { processingUtterance = false; });
       }
-
-      // Guard 3: skip empty transcript.
-      const toSend = (currentTranscript + (currentTranscript ? ' ' : '') + t).trim();
-      currentTranscript = '';
+    });
+    socket.on('UtteranceEnd', () => {
+      if (isSpeaking || processingUtterance) return;
+      const toSend = currentTranscript.trim();
       if (!toSend) return;
-
-      // Guard 4: set processingUtterance synchronously before the async call so any
-      // duplicate speech_final events arriving before isSpeaking is set are dropped.
-      console.log(`[Deepgram] Transcript received: "${toSend}"`);
+      currentTranscript = '';
+      console.log(`[Deepgram] UtteranceEnd fallback — sending: "${toSend}"`);
       processingUtterance = true;
       handleTranscript(toSend).finally(() => { processingUtterance = false; });
     });
