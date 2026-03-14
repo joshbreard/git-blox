@@ -53,6 +53,10 @@ function send(ws: WebSocket, data: object) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
 }
 
+function logTime(label: string, startMs: number) {
+  console.log(`[PERF] ${label}: ${Date.now() - startMs}ms`);
+}
+
 /**
  * Stream text to ElevenLabs TTS via WebSocket streaming-input endpoint.
  * Returns raw PCM_16000 chunks as an async generator.
@@ -294,8 +298,11 @@ wss.on('connection', (ws: WebSocket) => {
     if (!config || !transcript.trim()) return;
     isSpeaking = true;
     currentTranscript = '';
+    const t0 = Date.now();
+    console.log(`[PERF] ── Pipeline start ──`);
     if (deepgramSocket && deepgramReady) {
       try { deepgramSocket.requestClose(); } catch { /* ignore */ }
+      logTime('Deepgram close', t0);
     }
 
     try {
@@ -322,6 +329,8 @@ wss.on('connection', (ws: WebSocket) => {
           fullResponse += token;
         }
         console.log(`[OpenAI] Response received: "${fullResponse}"`);
+        logTime('LLM complete', t0);
+        console.log(`[PERF] LLM response length: ${fullResponse.length} chars`);
       } catch (err: unknown) {
         console.error('[OpenAI] Error calling LLM:', err instanceof Error ? err.stack ?? err.message : err);
         throw err;
@@ -336,6 +345,7 @@ wss.on('connection', (ws: WebSocket) => {
           audio_header: { audio_format: 0, channel_count: 1, samples_per_second: 16000, bits_per_sample: 16 },
         },
       });
+      logTime('A2F stream opened', t0);
 
       // Single WebSocket TTS call — yields raw PCM_16000
       // Stream PCM to A2F as chunks arrive, accumulate for WAV conversion
@@ -343,6 +353,7 @@ wss.on('connection', (ws: WebSocket) => {
       let idx = 0;
       try {
         for await (const chunk of streamElevenLabsTTS(fullResponse, config!.voiceId, config!.elevenLabsKey)) {
+          if (idx === 0) logTime('ElevenLabs first chunk', t0);
           pcmChunks.push(chunk);
           call.write({ audio_with_emotion: { audio_buffer: chunk } });
           if (idx % 10 === 0) console.log(`[A2F] Streaming PCM chunk: ${chunk.length} bytes`);
@@ -352,20 +363,24 @@ wss.on('connection', (ws: WebSocket) => {
         console.error('[ElevenLabs] PCM stream error:', err instanceof Error ? err.message : err);
       }
       call.end();
+      logTime('ElevenLabs chunks received', t0);
       console.log(`[ElevenLabs] PCM TTS complete, chunks: ${idx}`);
 
       const wavBuffer = pcmToWav(Buffer.concat(pcmChunks));
       console.log(`[ElevenLabs] WAV TTS complete, total bytes: ${wavBuffer.length}`);
+      logTime('WAV encoded', t0);
 
       // Send WAV audio to browser immediately — do NOT wait for A2F
       const audioBase64 = wavBuffer.toString('base64');
       incomingAudioChunks.length = 0;
       send(ws, { type: 'npc_response', audio: audioBase64, blendshapes: [], fps: 30 });
+      logTime('npc_response sent to browser', t0);
       send(ws, { type: 'response_end' });
 
       // A2F continues processing in background — send blendshapes when done
       const audioSentAt = Date.now();
       framesPromise.then((frames) => {
+        logTime('A2F blendshapes ready', t0);
         if (frames.length > 0) {
           send(ws, { type: 'npc_blendshapes', frames, fps: 30, audioOffsetMs: Date.now() - audioSentAt });
         }
@@ -382,8 +397,11 @@ wss.on('connection', (ws: WebSocket) => {
   async function startConversation() {
     if (!config || isSpeaking) return;
     isSpeaking = true;
+    const t0 = Date.now();
+    console.log(`[PERF] ── Pipeline start ──`);
     if (deepgramSocket && deepgramReady) {
       try { deepgramSocket.requestClose(); } catch { /* ignore */ }
+      logTime('Deepgram close', t0);
     }
 
     const openai = new OpenAI({ apiKey: config.openAiKey });
@@ -407,6 +425,8 @@ wss.on('connection', (ws: WebSocket) => {
       }
 
       console.log(`[startConversation] Greeting: "${fullResponse}"`);
+      logTime('LLM complete', t0);
+      console.log(`[PERF] LLM response length: ${fullResponse.length} chars`);
       send(ws, { type: 'response_start' });
 
       // Open A2F gRPC call before streaming starts so it's ready to receive
@@ -416,6 +436,7 @@ wss.on('connection', (ws: WebSocket) => {
           audio_header: { audio_format: 0, channel_count: 1, samples_per_second: 16000, bits_per_sample: 16 },
         },
       });
+      logTime('A2F stream opened', t0);
 
       // Single WebSocket TTS call — yields raw PCM_16000
       // Stream PCM to A2F as chunks arrive, accumulate for WAV conversion
@@ -423,6 +444,7 @@ wss.on('connection', (ws: WebSocket) => {
       let scIdx = 0;
       try {
         for await (const chunk of streamElevenLabsTTS(fullResponse, config!.voiceId, config!.elevenLabsKey)) {
+          if (scIdx === 0) logTime('ElevenLabs first chunk', t0);
           scPcmChunks.push(chunk);
           scCall.write({ audio_with_emotion: { audio_buffer: chunk } });
           if (scIdx % 10 === 0) console.log(`[A2F] Streaming PCM chunk: ${chunk.length} bytes`);
@@ -432,19 +454,23 @@ wss.on('connection', (ws: WebSocket) => {
         console.error('[ElevenLabs] PCM stream error:', err instanceof Error ? err.message : err);
       }
       scCall.end();
+      logTime('ElevenLabs chunks received', t0);
       console.log(`[ElevenLabs] PCM TTS complete, chunks: ${scIdx}`);
 
       const scWavBuffer = pcmToWav(Buffer.concat(scPcmChunks));
       console.log(`[ElevenLabs] WAV TTS complete, total bytes: ${scWavBuffer.length}`);
+      logTime('WAV encoded', t0);
 
       // Send WAV audio to browser immediately — do NOT wait for A2F
       const scAudioBase64 = scWavBuffer.toString('base64');
       send(ws, { type: 'npc_response', audio: scAudioBase64, blendshapes: [], fps: 30 });
+      logTime('npc_response sent to browser', t0);
       send(ws, { type: 'response_end' });
 
       // A2F continues processing in background — send blendshapes when done
       const scAudioSentAt = Date.now();
       scFramesPromise.then((frames) => {
+        logTime('A2F blendshapes ready', t0);
         if (frames.length > 0) {
           send(ws, { type: 'npc_blendshapes', frames, fps: 30, audioOffsetMs: Date.now() - scAudioSentAt });
         }

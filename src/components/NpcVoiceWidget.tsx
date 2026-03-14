@@ -202,6 +202,8 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
               setStatus('responding');
               break;
             case 'npc_response': {
+              const browserT0 = performance.now();
+              console.log(`[PERF-CLIENT] npc_response received`);
               const audioB64 = msg.audio as string;
               const frames = msg.blendshapes as BlendshapeFrame[];
               const fps = (msg.fps as number) ?? 30;
@@ -216,6 +218,7 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
                 const u8 = new Uint8Array(arrayBuf);
                 for (let i = 0; i < binary.length; i++) u8[i] = binary.charCodeAt(i);
                 playCtx.decodeAudioData(arrayBuf).then(buf => {
+                  console.log(`[PERF-CLIENT] decodeAudioData complete: ${(performance.now() - browserT0).toFixed(1)}ms`);
                   const src = playCtx.createBufferSource();
                   src.buffer = buf;
                   src.connect(playCtx.destination);
@@ -227,6 +230,7 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
                     }
                   };
                   resumeAndPlay();
+                  console.log(`[PERF-CLIENT] audio started: ${(performance.now() - browserT0).toFixed(1)}ms`);
                   console.log('[Audio] Playback started, duration:', buf.duration.toFixed(2), 's, ctx state:', playCtx.state);
                 }).catch(err => console.error('[Audio] decodeAudioData failed:', err));
               } else {
