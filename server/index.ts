@@ -327,6 +327,8 @@ wss.on('connection', (ws: WebSocket) => {
       }
       call.end();
       const pcmBuffer = Buffer.concat(pcmChunks);
+      console.log('[PCM] First 4 bytes (hex):', pcmBuffer.slice(0, 4).toString('hex'));
+      console.log('[PCM] First 4 bytes (ascii):', pcmBuffer.slice(0, 4).toString('ascii'));
       console.log(`[ElevenLabs] TTS complete, total PCM bytes: ${pcmBuffer.length}, chunks: ${chunkIndex}`);
 
       // Send audio to browser immediately — do NOT wait for A2F
@@ -402,6 +404,8 @@ wss.on('connection', (ws: WebSocket) => {
       }
       scCall.end();
       const scPcmBuffer = Buffer.concat(scPcmChunks);
+      console.log('[PCM] First 4 bytes (hex):', scPcmBuffer.slice(0, 4).toString('hex'));
+      console.log('[PCM] First 4 bytes (ascii):', scPcmBuffer.slice(0, 4).toString('ascii'));
       console.log(`[ElevenLabs] TTS complete, total PCM bytes: ${scPcmBuffer.length}, chunks: ${scChunkIndex}`);
 
       // Send audio to browser immediately — do NOT wait for A2F
