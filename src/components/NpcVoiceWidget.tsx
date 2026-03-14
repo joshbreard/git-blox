@@ -75,6 +75,7 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
   const blendshapeIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const morphMeshRef = useRef<THREE.Mesh | null>(null);
   const audioStartMsRef = useRef<number>(0);
+  const nextStartTimeRef = useRef<number>(0);
 
   const isActive = status !== 'idle' && status !== 'error';
 
@@ -202,60 +203,33 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
               setStatus('responding');
               break;
             case 'npc_response': {
-              const browserT0 = performance.now();
-              console.log(`[PERF-CLIENT] npc_response received`);
-              const audioB64 = msg.audio as string;
-              const frames = msg.blendshapes as BlendshapeFrame[];
-              const fps = (msg.fps as number) ?? 30;
+              const { audio } = msg as { audio: string; sentenceIndex: number };
 
-              // Record when audio starts so blendshapes arriving later can sync
-              audioStartMsRef.current = performance.now();
-
-              const playCtx = playbackCtxRef.current;
-              if (playCtx) {
-                const binary = atob(audioB64);
-                const arrayBuf = new ArrayBuffer(binary.length);
-                const u8 = new Uint8Array(arrayBuf);
-                for (let i = 0; i < binary.length; i++) u8[i] = binary.charCodeAt(i);
-                playCtx.decodeAudioData(arrayBuf).then(buf => {
-                  console.log(`[PERF-CLIENT] decodeAudioData complete: ${(performance.now() - browserT0).toFixed(1)}ms`);
-                  const src = playCtx.createBufferSource();
-                  src.buffer = buf;
-                  src.connect(playCtx.destination);
-                  const resumeAndPlay = () => {
-                    if (playCtx.state === 'suspended') {
-                      playCtx.resume().then(() => src.start()).catch(err => console.error('[Audio] resume failed:', err));
-                    } else {
-                      src.start();
-                    }
-                  };
-                  resumeAndPlay();
-                  console.log(`[PERF-CLIENT] audio started: ${(performance.now() - browserT0).toFixed(1)}ms`);
-                  console.log('[Audio] Playback started, duration:', buf.duration.toFixed(2), 's, ctx state:', playCtx.state);
-                }).catch(err => console.error('[Audio] decodeAudioData failed:', err));
-              } else {
+              const ctx = playbackCtxRef.current;
+              if (!ctx) {
                 console.error('[Audio] Playback AudioContext is null — cannot play');
+                break;
               }
 
-              // Drive blendshapes inline only if server sent them with the audio (warm A2F path)
-              if (blendshapeIntervalRef.current) clearInterval(blendshapeIntervalRef.current);
-              const mesh = morphMeshRef.current;
-              if (mesh && frames.length > 0) {
-                let frameIdx = 0;
-                blendshapeIntervalRef.current = setInterval(() => {
-                  if (frameIdx >= frames.length) {
-                    clearInterval(blendshapeIntervalRef.current!);
-                    blendshapeIntervalRef.current = null;
-                    return;
-                  }
-                  const frame = frames[frameIdx++];
-                  if (!mesh.morphTargetInfluences || !mesh.morphTargetDictionary) return;
-                  for (const [arkitKey, weight] of Object.entries(frame.values)) {
-                    const idx = resolveBlendshapeIndex(mesh, arkitKey);
-                    if (idx >= 0) mesh.morphTargetInfluences[idx] = weight;
-                  }
-                }, 1000 / fps);
+              // Record when first sentence audio starts so blendshapes arriving later can sync
+              if (nextStartTimeRef.current === 0) {
+                audioStartMsRef.current = performance.now();
               }
+
+              const u8 = Uint8Array.from(atob(audio), c => c.charCodeAt(0));
+              const arrayBuf = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+
+              ctx.decodeAudioData(arrayBuf as ArrayBuffer).then(audioBuf => {
+                const startTime = Math.max(ctx.currentTime, nextStartTimeRef.current);
+                nextStartTimeRef.current = startTime + audioBuf.duration;
+
+                const src = ctx.createBufferSource();
+                src.buffer = audioBuf;
+                src.connect(ctx.destination);
+                src.start(startTime);
+
+                console.log(`[PERF-CLIENT] Sentence scheduled at ${startTime.toFixed(2)}s, duration: ${audioBuf.duration.toFixed(2)}s`);
+              }).catch(err => console.error('[Audio] decodeAudioData failed:', err));
               break;
             }
 
@@ -303,6 +277,7 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
               break;
             }
             case 'response_end':
+              nextStartTimeRef.current = 0;
               listeningRef.current = true;
               setStatus('listening');
               break;

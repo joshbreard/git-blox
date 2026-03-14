@@ -57,6 +57,22 @@ function logTime(label: string, startMs: number) {
   console.log(`[PERF] ${label}: ${Date.now() - startMs}ms`);
 }
 
+function extractCompleteSentences(buffer: string): { sentences: string[]; remainder: string } {
+  const regex = /[^.!?]*[.!?]+/g;
+  const sentences: string[] = [];
+  let lastIndex = 0;
+  let match;
+  while ((match = regex.exec(buffer)) !== null) {
+    const s = match[0].trim();
+    if (s) sentences.push(s);
+    lastIndex = regex.lastIndex;
+  }
+  return {
+    sentences,
+    remainder: buffer.slice(lastIndex).trim(),
+  };
+}
+
 /**
  * Stream text to ElevenLabs TTS via WebSocket streaming-input endpoint.
  * Returns raw PCM_16000 chunks as an async generator.
@@ -310,36 +326,8 @@ wss.on('connection', (ws: WebSocket) => {
 
     try {
       send(ws, { type: 'transcript', text: transcript });
-      send(ws, { type: 'response_start' });
 
       const openai = new OpenAI({ apiKey: config.openAiKey });
-
-      // Stream LLM response
-      let fullResponse = '';
-      console.log(`[OpenAI] Sending to LLM: "${transcript}"`);
-      try {
-        const stream = await openai.chat.completions.create({
-          model: 'gpt-4o',
-          stream: true,
-          messages: [
-            { role: 'system', content: config.personalityPrompt },
-            { role: 'user', content: transcript },
-          ],
-        });
-
-        for await (const chunk of stream) {
-          const token = chunk.choices[0]?.delta?.content ?? '';
-          fullResponse += token;
-        }
-        console.log(`[OpenAI] Response received: "${fullResponse}"`);
-        logTime('LLM complete', t0);
-        console.log(`[PERF] LLM response length: ${fullResponse.length} chars`);
-      } catch (err: unknown) {
-        console.error('[OpenAI] Error calling LLM:', err instanceof Error ? err.stack ?? err.message : err);
-        throw err;
-      }
-
-      console.log(`[ElevenLabs] Sending TTS for: "${fullResponse}"`);
 
       // Open A2F gRPC call before streaming starts so it's ready to receive
       const { call, framesPromise } = openA2FCall(config.nvidiaApiKey, config.nvidiaFunctionId);
@@ -350,34 +338,80 @@ wss.on('connection', (ws: WebSocket) => {
       });
       logTime('A2F stream opened', t0);
 
-      // Single WebSocket TTS call — yields raw PCM_16000
-      // Stream PCM to A2F as chunks arrive, accumulate for WAV conversion
-      const pcmChunks: Buffer[] = [];
-      let idx = 0;
+      send(ws, { type: 'response_start' });
+
+      let sentenceBuffer = '';
+      let sentenceIndex = 0;
+      let fullResponse = '';
+      const allPcmChunks: Buffer[] = [];
+
+      console.log(`[OpenAI] Sending to LLM: "${transcript}"`);
+      let llmStream;
       try {
-        for await (const chunk of streamElevenLabsTTS(fullResponse, config!.voiceId, config!.elevenLabsKey)) {
-          if (idx === 0) logTime('ElevenLabs first chunk', t0);
-          pcmChunks.push(chunk);
-          call.write({ audio_with_emotion: { audio_buffer: chunk } });
-          if (idx % 10 === 0) console.log(`[A2F] Streaming PCM chunk: ${chunk.length} bytes`);
-          idx++;
-        }
+        llmStream = await openai.chat.completions.create({
+          model: 'gpt-4o',
+          stream: true,
+          messages: [
+            { role: 'system', content: config.personalityPrompt },
+            { role: 'user', content: transcript },
+          ],
+        });
       } catch (err: unknown) {
-        console.error('[ElevenLabs] PCM stream error:', err instanceof Error ? err.message : err);
+        console.error('[OpenAI] Error calling LLM:', err instanceof Error ? err.stack ?? err.message : err);
+        throw err;
       }
+
+      async function processSentence(sentence: string) {
+        const idx = sentenceIndex++;
+        console.log(`[JIT] Sentence ${idx}: "${sentence}"`);
+        const pcmChunks: Buffer[] = [];
+        for await (const chunk of streamElevenLabsTTS(sentence, config!.voiceId, config!.elevenLabsKey)) {
+          pcmChunks.push(chunk);
+          allPcmChunks.push(chunk);
+          call.write({ audio_with_emotion: { audio_buffer: chunk } });
+        }
+        const wavBuffer = pcmToWav(Buffer.concat(pcmChunks));
+        console.log(`[JIT] Sentence ${idx} WAV ready: ${wavBuffer.length} bytes`);
+        send(ws, {
+          type: 'npc_response',
+          audio: wavBuffer.toString('base64'),
+          sentenceIndex: idx,
+          blendshapes: [],
+          fps: 30,
+        });
+      }
+
+      const sentencePromises: Promise<void>[] = [];
+
+      for await (const chunk of llmStream) {
+        const token = chunk.choices[0]?.delta?.content ?? '';
+        fullResponse += token;
+        sentenceBuffer += token;
+        const { sentences, remainder } = extractCompleteSentences(sentenceBuffer);
+        if (sentences.length > 0) {
+          sentenceBuffer = remainder;
+          for (const sentence of sentences) {
+            const prev = sentencePromises[sentencePromises.length - 1] ?? Promise.resolve();
+            sentencePromises.push(prev.then(() => processSentence(sentence)));
+          }
+        }
+      }
+
+      console.log(`[OpenAI] Response received: "${fullResponse}"`);
+      logTime('LLM complete', t0);
+      console.log(`[PERF] LLM response length: ${fullResponse.length} chars`);
+
+      // Handle any remaining text without terminal punctuation
+      if (sentenceBuffer.trim()) {
+        const prev = sentencePromises[sentencePromises.length - 1] ?? Promise.resolve();
+        sentencePromises.push(prev.then(() => processSentence(sentenceBuffer.trim())));
+      }
+
+      await Promise.all(sentencePromises);
       call.end();
-      logTime('ElevenLabs chunks received', t0);
-      console.log(`[ElevenLabs] PCM TTS complete, chunks: ${idx}`);
 
-      const wavBuffer = pcmToWav(Buffer.concat(pcmChunks));
-      console.log(`[ElevenLabs] WAV TTS complete, total bytes: ${wavBuffer.length}`);
-      logTime('WAV encoded', t0);
-
-      // Send WAV audio to browser immediately — do NOT wait for A2F
-      const audioBase64 = wavBuffer.toString('base64');
+      console.log(`[JIT] All sentences sent, total PCM: ${allPcmChunks.length} chunks`);
       incomingAudioChunks.length = 0;
-      send(ws, { type: 'npc_response', audio: audioBase64, blendshapes: [], fps: 30 });
-      logTime('npc_response sent to browser', t0);
       send(ws, { type: 'response_end' });
 
       // A2F continues processing in background — send blendshapes when done
@@ -412,8 +446,23 @@ wss.on('connection', (ws: WebSocket) => {
     const greetingPrompt = 'Start the conversation by greeting the player and asking them one short question. Speak in character.';
 
     try {
+      // Open A2F gRPC call before streaming starts so it's ready to receive
+      const { call, framesPromise } = openA2FCall(config.nvidiaApiKey, config.nvidiaFunctionId);
+      call.write({
+        audio_stream_header: {
+          audio_header: { audio_format: 0, channel_count: 1, samples_per_second: 16000, bits_per_sample: 16 },
+        },
+      });
+      logTime('A2F stream opened', t0);
+
+      send(ws, { type: 'response_start' });
+
+      let sentenceBuffer = '';
+      let sentenceIndex = 0;
       let fullResponse = '';
-      const stream = await openai.chat.completions.create({
+      const allPcmChunks: Buffer[] = [];
+
+      const llmStream = await openai.chat.completions.create({
         model: 'gpt-4o',
         stream: true,
         messages: [
@@ -422,60 +471,64 @@ wss.on('connection', (ws: WebSocket) => {
         ],
       });
 
-      for await (const chunk of stream) {
+      async function processSentence(sentence: string) {
+        const idx = sentenceIndex++;
+        console.log(`[JIT] Sentence ${idx}: "${sentence}"`);
+        const pcmChunks: Buffer[] = [];
+        for await (const chunk of streamElevenLabsTTS(sentence, config!.voiceId, config!.elevenLabsKey)) {
+          pcmChunks.push(chunk);
+          allPcmChunks.push(chunk);
+          call.write({ audio_with_emotion: { audio_buffer: chunk } });
+        }
+        const wavBuffer = pcmToWav(Buffer.concat(pcmChunks));
+        console.log(`[JIT] Sentence ${idx} WAV ready: ${wavBuffer.length} bytes`);
+        send(ws, {
+          type: 'npc_response',
+          audio: wavBuffer.toString('base64'),
+          sentenceIndex: idx,
+          blendshapes: [],
+          fps: 30,
+        });
+      }
+
+      const sentencePromises: Promise<void>[] = [];
+
+      for await (const chunk of llmStream) {
         const token = chunk.choices[0]?.delta?.content ?? '';
         fullResponse += token;
+        sentenceBuffer += token;
+        const { sentences, remainder } = extractCompleteSentences(sentenceBuffer);
+        if (sentences.length > 0) {
+          sentenceBuffer = remainder;
+          for (const sentence of sentences) {
+            const prev = sentencePromises[sentencePromises.length - 1] ?? Promise.resolve();
+            sentencePromises.push(prev.then(() => processSentence(sentence)));
+          }
+        }
       }
 
       console.log(`[startConversation] Greeting: "${fullResponse}"`);
       logTime('LLM complete', t0);
       console.log(`[PERF] LLM response length: ${fullResponse.length} chars`);
-      send(ws, { type: 'response_start' });
 
-      // Open A2F gRPC call before streaming starts so it's ready to receive
-      const { call: scCall, framesPromise: scFramesPromise } = openA2FCall(config.nvidiaApiKey, config.nvidiaFunctionId);
-      scCall.write({
-        audio_stream_header: {
-          audio_header: { audio_format: 0, channel_count: 1, samples_per_second: 16000, bits_per_sample: 16 },
-        },
-      });
-      logTime('A2F stream opened', t0);
-
-      // Single WebSocket TTS call — yields raw PCM_16000
-      // Stream PCM to A2F as chunks arrive, accumulate for WAV conversion
-      const scPcmChunks: Buffer[] = [];
-      let scIdx = 0;
-      try {
-        for await (const chunk of streamElevenLabsTTS(fullResponse, config!.voiceId, config!.elevenLabsKey)) {
-          if (scIdx === 0) logTime('ElevenLabs first chunk', t0);
-          scPcmChunks.push(chunk);
-          scCall.write({ audio_with_emotion: { audio_buffer: chunk } });
-          if (scIdx % 10 === 0) console.log(`[A2F] Streaming PCM chunk: ${chunk.length} bytes`);
-          scIdx++;
-        }
-      } catch (err: unknown) {
-        console.error('[ElevenLabs] PCM stream error:', err instanceof Error ? err.message : err);
+      // Handle any remaining text without terminal punctuation
+      if (sentenceBuffer.trim()) {
+        const prev = sentencePromises[sentencePromises.length - 1] ?? Promise.resolve();
+        sentencePromises.push(prev.then(() => processSentence(sentenceBuffer.trim())));
       }
-      scCall.end();
-      logTime('ElevenLabs chunks received', t0);
-      console.log(`[ElevenLabs] PCM TTS complete, chunks: ${scIdx}`);
 
-      const scWavBuffer = pcmToWav(Buffer.concat(scPcmChunks));
-      console.log(`[ElevenLabs] WAV TTS complete, total bytes: ${scWavBuffer.length}`);
-      logTime('WAV encoded', t0);
+      await Promise.all(sentencePromises);
+      call.end();
 
-      // Send WAV audio to browser immediately — do NOT wait for A2F
-      const scAudioBase64 = scWavBuffer.toString('base64');
-      send(ws, { type: 'npc_response', audio: scAudioBase64, blendshapes: [], fps: 30 });
-      logTime('npc_response sent to browser', t0);
+      console.log(`[JIT] All sentences sent, total PCM: ${allPcmChunks.length} chunks`);
       send(ws, { type: 'response_end' });
 
       // A2F continues processing in background — send blendshapes when done
-      const scAudioSentAt = Date.now();
-      scFramesPromise.then((frames) => {
+      const audioSentAt = Date.now();
+      framesPromise.then((frames) => {
         logTime('A2F blendshapes ready', t0);
         if (frames.length > 0) {
-          send(ws, { type: 'npc_blendshapes', frames, fps: 30, audioOffsetMs: Date.now() - scAudioSentAt });
+          send(ws, { type: 'npc_blendshapes', frames, fps: 30, audioOffsetMs: Date.now() - audioSentAt });
         }
       }).catch(() => { /* logged inside openA2FCall */ });
     } catch (err: unknown) {
