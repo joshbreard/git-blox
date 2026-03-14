@@ -292,6 +292,8 @@ wss.on('connection', (ws: WebSocket) => {
   // Set synchronously before handleTranscript is called; prevents a second
   // speech_final event from slipping through before isSpeaking is set inside handleTranscript.
   let processingUtterance = false;
+  let lastAudioReceivedMs = 0;
+  let firstSegmentMs = 0;
 
   async function handleTranscript(transcript: string) {
     if (isSpeaking) return;
@@ -538,6 +540,10 @@ wss.on('connection', (ws: WebSocket) => {
 
       // Accumulate is_final segments (not speech_final yet)
       if (msg.is_final && t) {
+        if (!firstSegmentMs) {
+          firstSegmentMs = Date.now();
+          console.log(`[PERF-DG] First is_final segment — ${Date.now() - lastAudioReceivedMs}ms after last audio chunk`);
+        }
         currentTranscript += (currentTranscript ? ' ' : '') + t;
         console.log(`[Deepgram] Segment final — confidence:${confidence.toFixed(3)} transcript:"${t}" accumulated:"${currentTranscript}"`);
       }
@@ -551,6 +557,8 @@ wss.on('connection', (ws: WebSocket) => {
           console.log(`[Deepgram] speech_final but low confidence (${confidence.toFixed(3)}) — skipping`);
           return;
         }
+        console.log(`[PERF-DG] speech_final fired — ${Date.now() - firstSegmentMs}ms after first segment, ${Date.now() - lastAudioReceivedMs}ms after last audio`);
+        firstSegmentMs = 0;
         console.log(`[Deepgram] Utterance complete — sending: "${toSend}"`);
         processingUtterance = true;
         handleTranscript(toSend).finally(() => { processingUtterance = false; });
@@ -561,6 +569,8 @@ wss.on('connection', (ws: WebSocket) => {
       const toSend = currentTranscript.trim();
       if (!toSend) return;
       currentTranscript = '';
+      console.log(`[PERF-DG] UtteranceEnd fired — ${Date.now() - firstSegmentMs}ms after first segment, ${Date.now() - lastAudioReceivedMs}ms after last audio`);
+      firstSegmentMs = 0;
       console.log(`[Deepgram] UtteranceEnd fallback — sending: "${toSend}"`);
       processingUtterance = true;
       handleTranscript(toSend).finally(() => { processingUtterance = false; });
@@ -605,6 +615,7 @@ wss.on('connection', (ws: WebSocket) => {
 
     // Subsequent binary messages are raw Int16 PCM audio
     if (isBinary) {
+      lastAudioReceivedMs = Date.now();
       incomingAudioChunks.push(Buffer.from(data));
       if (deepgramSocket && deepgramReady) {
         deepgramSocket.send(data);
