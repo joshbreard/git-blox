@@ -220,7 +220,10 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
               const arrayBuf = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
 
               ctx.decodeAudioData(arrayBuf as ArrayBuffer).then(audioBuf => {
-                const startTime = Math.max(ctx.currentTime, nextStartTimeRef.current);
+                const now = ctx.currentTime;
+                const startTime = nextStartTimeRef.current > now + 0.05
+                  ? nextStartTimeRef.current
+                  : now + 0.05;
                 nextStartTimeRef.current = startTime + audioBuf.duration;
 
                 const src = ctx.createBufferSource();
