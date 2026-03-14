@@ -219,7 +219,15 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
                   const src = playCtx.createBufferSource();
                   src.buffer = buf;
                   src.connect(playCtx.destination);
-                  src.start();
+                  const resumeAndPlay = () => {
+                    if (playCtx.state === 'suspended') {
+                      playCtx.resume().then(() => src.start()).catch(err => console.error('[Audio] resume failed:', err));
+                    } else {
+                      src.start();
+                    }
+                  };
+                  resumeAndPlay();
+                  console.log('[Audio] Playback started, duration:', buf.duration.toFixed(2), 's, ctx state:', playCtx.state);
                 }).catch(err => console.error('[Audio] decodeAudioData failed:', err));
               } else {
                 console.error('[Audio] Playback AudioContext is null — cannot play');
@@ -310,7 +318,7 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
 
       ws.onclose = () => {
         listeningRef.current = false;
-        if (status !== 'idle') setStatus('idle');
+        setStatus('idle');
       };
 
       // ── PCM streaming ─────────────────────────────────────────────────────
