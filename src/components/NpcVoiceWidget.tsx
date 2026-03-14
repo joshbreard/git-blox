@@ -72,18 +72,18 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
   const streamRef = useRef<MediaStream | null>(null);
   const listeningRef = useRef<boolean>(false);
 
-  const blendshapeIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const rafIdRef = useRef<number | null>(null);
   const morphMeshRef = useRef<THREE.Mesh | null>(null);
-  const audioStartMsRef = useRef<number>(0);
+  const audioScheduledAtRef = useRef<number>(0);
   const nextStartTimeRef = useRef<number>(0);
 
   const isActive = status !== 'idle' && status !== 'error';
 
   // ── Stop / cleanup ─────────────────────────────────────────────────────────
   const stop = useCallback(() => {
-    if (blendshapeIntervalRef.current) {
-      clearInterval(blendshapeIntervalRef.current);
-      blendshapeIntervalRef.current = null;
+    if (rafIdRef.current) {
+      cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
     }
     processorRef.current?.disconnect();
     processorRef.current = null;
@@ -211,11 +211,6 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
                 break;
               }
 
-              // Record when first sentence audio starts so blendshapes arriving later can sync
-              if (nextStartTimeRef.current === 0) {
-                audioStartMsRef.current = performance.now();
-              }
-
               const u8 = Uint8Array.from(atob(audio), c => c.charCodeAt(0));
               const arrayBuf = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
 
@@ -237,6 +232,7 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
                 src.buffer = audioBuf;
                 src.connect(ctx.destination);
                 src.start(reservedStart);
+                audioScheduledAtRef.current = reservedStart;
 
                 console.log(`[PERF-CLIENT] Sentence scheduled at ${reservedStart.toFixed(2)}s, duration: ${audioBuf.duration.toFixed(2)}s`);
               }).catch(err => console.error('[Audio] decodeAudioData failed:', err));
@@ -244,7 +240,6 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
             }
 
             case 'npc_blendshapes': {
-              // A2F completed after audio was already sent — sync animation to elapsed playback time
               const frames = msg.frames as BlendshapeFrame[];
               const fps = (msg.fps as number) ?? 30;
               const mesh = morphMeshRef.current;
@@ -253,37 +248,61 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
                   !mesh ? 'morph mesh is null' : 'frames array is empty');
                 break;
               }
+              const ctx = playbackCtxRef.current;
+              if (!ctx) break;
 
-              const audioOffsetMs = (msg.audioOffsetMs as number) ?? 0;
-              const elapsedMs = audioOffsetMs > 0
-                ? audioOffsetMs
-                : performance.now() - audioStartMsRef.current;
-              const totalDurationMs = (frames.length / fps) * 1000;
-              // If A2F arrived after the audio already finished, replay from frame 0.
-              // Without this guard startFrameIdx is clamped to frames.length-1 and
-              // the interval fires exactly once — no visible animation.
-              const rawStartIdx = Math.floor(elapsedMs / (1000 / fps));
-              const startFrameIdx = rawStartIdx >= frames.length ? 0
-                : Math.min(rawStartIdx, frames.length - 1);
-              console.log('[NpcVoice] npc_blendshapes — frames:', frames.length,
-                'elapsedMs:', elapsedMs.toFixed(0), 'totalDurationMs:', totalDurationMs.toFixed(0),
-                'startFrame:', startFrameIdx, elapsedMs >= totalDurationMs ? '(replaying from 0)' : '(synced)');
+              if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
 
-              if (blendshapeIntervalRef.current) clearInterval(blendshapeIntervalRef.current);
-              let frameIdx = startFrameIdx;
-              blendshapeIntervalRef.current = setInterval(() => {
-                if (frameIdx >= frames.length) {
-                  clearInterval(blendshapeIntervalRef.current!);
-                  blendshapeIntervalRef.current = null;
+              // Build index map once — skip keys not found in this mesh
+              const indexMap = new Map<string, number>();
+              for (const key of Object.keys(arkitMap as Record<string, unknown>)) {
+                const idx = resolveBlendshapeIndex(mesh, key);
+                if (idx >= 0) indexMap.set(key, idx);
+              }
+
+              const tick = () => {
+                const t = Math.max(0, ctx.currentTime - audioScheduledAtRef.current);
+
+                // Binary search: last frame where frame.timestamp <= t
+                let lo = 0, hi = frames.length - 1, i = 0;
+                while (lo <= hi) {
+                  const mid = (lo + hi) >> 1;
+                  if (frames[mid].timestamp <= t) { i = mid; lo = mid + 1; }
+                  else hi = mid - 1;
+                }
+
+                // Past the last frame — zero out and stop
+                if (t > frames[frames.length - 1].timestamp) {
+                  if (mesh.morphTargetInfluences) {
+                    for (const idx of indexMap.values()) {
+                      mesh.morphTargetInfluences[idx] = 0;
+                    }
+                  }
+                  rafIdRef.current = null;
                   return;
                 }
-                const frame = frames[frameIdx++];
-                if (!mesh.morphTargetInfluences || !mesh.morphTargetDictionary) return;
-                for (const [arkitKey, weight] of Object.entries(frame.values)) {
-                  const idx = resolveBlendshapeIndex(mesh, arkitKey);
-                  if (idx >= 0) mesh.morphTargetInfluences[idx] = weight;
+
+                if (i < frames.length - 1) {
+                  const alpha = (t - frames[i].timestamp) / (frames[i + 1].timestamp - frames[i].timestamp);
+                  if (mesh.morphTargetInfluences) {
+                    for (const [key, idx] of indexMap) {
+                      mesh.morphTargetInfluences[idx] =
+                        (frames[i].values[key] ?? 0) * (1 - alpha) +
+                        (frames[i + 1].values[key] ?? 0) * alpha;
+                    }
+                  }
+                } else {
+                  if (mesh.morphTargetInfluences) {
+                    for (const [key, idx] of indexMap) {
+                      mesh.morphTargetInfluences[idx] = frames[i].values[key] ?? 0;
+                    }
+                  }
                 }
-              }, 1000 / fps);
+
+                rafIdRef.current = requestAnimationFrame(tick);
+              };
+
+              rafIdRef.current = requestAnimationFrame(tick);
               break;
             }
             case 'response_end': {

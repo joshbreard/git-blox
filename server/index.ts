@@ -415,11 +415,11 @@ wss.on('connection', (ws: WebSocket) => {
       send(ws, { type: 'response_end' });
 
       // A2F continues processing in background — send blendshapes when done
-      const audioSentAt = Date.now();
+      const audioSentAtMs = Date.now();
       framesPromise.then((frames) => {
         logTime('A2F blendshapes ready', t0);
         if (frames.length > 0) {
-          send(ws, { type: 'npc_blendshapes', frames, fps: 30, audioOffsetMs: Date.now() - audioSentAt });
+          send(ws, { type: 'npc_blendshapes', frames, fps: 30, audioSentAtMs });
         }
       }).catch(() => { /* logged inside openA2FCall */ });
     } catch (err: unknown) {
@@ -524,11 +524,11 @@ wss.on('connection', (ws: WebSocket) => {
       send(ws, { type: 'response_end' });
 
       // A2F continues processing in background — send blendshapes when done
-      const audioSentAt = Date.now();
+      const audioSentAtMs = Date.now();
       framesPromise.then((frames) => {
         logTime('A2F blendshapes ready', t0);
         if (frames.length > 0) {
-          send(ws, { type: 'npc_blendshapes', frames, fps: 30, audioOffsetMs: Date.now() - audioSentAt });
+          send(ws, { type: 'npc_blendshapes', frames, fps: 30, audioSentAtMs });
         }
       }).catch(() => { /* logged inside openA2FCall */ });
     } catch (err: unknown) {
