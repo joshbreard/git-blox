@@ -59,7 +59,7 @@ function logTime(label: string, startMs: number) {
   console.log(`[PERF] ${label}: ${Date.now() - startMs}ms`);
 }
 
-function extractCompleteSentences(buffer: string, firstSentenceSent: boolean): { sentences: string[]; remainder: string } {
+function extractCompleteSentences(buffer: string, firstSentenceSent: boolean, maxFirstSentenceChars = 60): { sentences: string[]; remainder: string } {
   const regex = /[^.!?]*[.!?]+/g;
   const sentences: string[] = [];
   let lastIndex = 0;
@@ -69,21 +69,34 @@ function extractCompleteSentences(buffer: string, firstSentenceSent: boolean): {
     if (s) sentences.push(s);
     lastIndex = regex.lastIndex;
   }
-  const remainder = buffer.slice(lastIndex).trim();
+  let remainder = buffer.slice(lastIndex).trim();
 
   // If no sentence-ending punctuation found and first sentence hasn't been sent,
-  // treat comma + 6 or more following words as a flush point to reduce TTFA
+  // treat comma with at least 4 words before it as a flush point to reduce TTFA
   if (sentences.length === 0 && !firstSentenceSent && remainder) {
     const commaIdx = remainder.indexOf(',');
     if (commaIdx >= 0) {
-      const afterComma = remainder.slice(commaIdx + 1).trim();
-      const wordCount = afterComma.split(/\s+/).filter(Boolean).length;
-      if (wordCount >= 6) {
-        return {
-          sentences: [remainder.slice(0, commaIdx + 1).trim()],
-          remainder: afterComma,
-        };
+      const beforeComma = remainder.slice(0, commaIdx).trim();
+      const wordCount = beforeComma.split(/\s+/).filter(Boolean).length;
+      if (wordCount >= 4) {
+        const afterComma = remainder.slice(commaIdx + 1).trim();
+        sentences.push(remainder.slice(0, commaIdx + 1).trim());
+        remainder = afterComma;
       }
+    }
+  }
+
+  // Hard-truncate the first sentence if it exceeds maxFirstSentenceChars
+  if (!firstSentenceSent && sentences.length > 0 && sentences[0].length > maxFirstSentenceChars) {
+    const first = sentences[0];
+    // Find the last word boundary at or before the cap
+    const truncateAt = first.lastIndexOf(' ', maxFirstSentenceChars);
+    if (truncateAt > 0) {
+      const truncated = first.slice(0, truncateAt).replace(/[.,!?]+$/, '') + '.';
+      const leftover = first.slice(truncateAt + 1);
+      sentences[0] = truncated;
+      // Prepend the leftover to the remainder so it becomes the next sentence
+      remainder = leftover + (remainder ? ' ' + remainder : '');
     }
   }
 
@@ -361,7 +374,7 @@ wss.on('connection', (ws: WebSocket) => {
           model: config.llmModel,
           stream: true,
           messages: [
-            { role: 'system', content: config.personalityPrompt },
+            { role: 'system', content: `${config.personalityPrompt}\n\nIMPORTANT: Your FIRST sentence must be 4 words or fewer and end with punctuation. No exceptions. After that first short sentence, continue naturally with as much detail as you want.` },
             { role: 'user', content: transcript },
           ],
         });
@@ -474,8 +487,8 @@ wss.on('connection', (ws: WebSocket) => {
     }
 
     const openai = new OpenAI({ apiKey: config.openAiKey });
-    const system = config.personalityPrompt ?? 'You are a helpful NPC.';
-    const greetingPrompt = 'Start the conversation by greeting the player and asking them one short question. Speak in character.';
+    const system = `${config.personalityPrompt ?? 'You are a helpful NPC.'}\n\nIMPORTANT: Your FIRST sentence must be 4 words or fewer and end with punctuation. No exceptions. After that first short sentence, continue naturally with as much detail as you want.`;
+    const greetingPrompt = 'Say hello in 3 words. Then ask one question.';
 
     try {
       send(ws, { type: 'response_start' });
