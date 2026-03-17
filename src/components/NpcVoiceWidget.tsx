@@ -5,8 +5,10 @@
  * 1. Captures mic via Web Audio API (AudioWorkletNode → Int16 PCM at 16 kHz)
  * 2. Opens a WebSocket to the NPC voice backend
  * 3. Streams PCM + personality config on init
- * 4. Receives npc_response JSON with base64 WAV audio + blendshape frames
- * 5. Decodes and plays audio; simultaneously steps through blendshape frames at 30fps via setInterval
+ * 4. Receives per-sentence npc_response with base64 WAV audio
+ * 5. Receives per-sentence npc_sentence_blendshapes with A2F frames
+ * 6. Plays filler idle animation until real blendshapes arrive
+ * 7. Syncs blendshape frames to audio playback position via requestAnimationFrame
  */
 
 import { useRef, useState, useCallback } from 'react';
@@ -54,6 +56,35 @@ function findMorphMesh(root: THREE.Object3D): THREE.Mesh | null {
   return found;
 }
 
+/** Apply idle/filler blendshape animation: subtle jaw oscillation + periodic blink. */
+function applyFillerAnimation(mesh: THREE.Mesh, timeMs: number) {
+  if (!mesh.morphTargetInfluences || !mesh.morphTargetDictionary) return;
+
+  // Reset all morph targets to neutral
+  for (let i = 0; i < mesh.morphTargetInfluences.length; i++) {
+    mesh.morphTargetInfluences[i] = 0;
+  }
+
+  // Subtle jawOpen oscillation at ~2Hz (0 → 0.04)
+  const jawVal = Math.abs(Math.sin(timeMs / 1000 * Math.PI * 4)) * 0.04;
+  const jawIdx = resolveBlendshapeIndex(mesh, 'jawOpen');
+  if (jawIdx >= 0) mesh.morphTargetInfluences[jawIdx] = jawVal;
+
+  // Eye blink every ~4 seconds (quick 150ms close-open triangle wave)
+  const BLINK_PERIOD = 4.0;
+  const BLINK_DURATION = 0.15;
+  const t = (timeMs / 1000) % BLINK_PERIOD;
+  let blinkVal = 0;
+  if (t > BLINK_PERIOD - BLINK_DURATION) {
+    const p = (t - (BLINK_PERIOD - BLINK_DURATION)) / BLINK_DURATION;
+    blinkVal = p < 0.5 ? p * 2 : (1 - p) * 2;
+  }
+  const leftIdx = resolveBlendshapeIndex(mesh, 'eyeBlinkLeft');
+  const rightIdx = resolveBlendshapeIndex(mesh, 'eyeBlinkRight');
+  if (leftIdx >= 0) mesh.morphTargetInfluences[leftIdx] = blinkVal;
+  if (rightIdx >= 0) mesh.morphTargetInfluences[rightIdx] = blinkVal;
+}
+
 export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
   const config = useEditorStore((s) => s.npcConfig);
   const objects = useEditorStore((s) => s.objects);
@@ -72,19 +103,91 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
   const streamRef = useRef<MediaStream | null>(null);
   const listeningRef = useRef<boolean>(false);
 
-  const blendshapeIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const morphMeshRef = useRef<THREE.Mesh | null>(null);
-  const audioStartMsRef = useRef<number>(0);
   const nextStartTimeRef = useRef<number>(0);
+
+  // Per-sentence blendshape state
+  const sentenceBlendshapesRef = useRef<Map<number, BlendshapeFrame[]>>(new Map());
+  const sentenceAudioRef = useRef<Map<number, { startTime: number; duration: number }>>(new Map());
+  const fillerEnabledRef = useRef<Set<number>>(new Set());
+  const blendshapeRafRef = useRef<number | null>(null);
 
   const isActive = status !== 'idle' && status !== 'error';
 
+  // ── Animation loop ────────────────────────────────────────────────────────
+  function startBlendshapeLoop() {
+    if (blendshapeRafRef.current !== null) return; // already running
+
+    function tick() {
+      const ctx = playbackCtxRef.current;
+      const mesh = morphMeshRef.current;
+      if (!ctx || !mesh?.morphTargetInfluences) {
+        blendshapeRafRef.current = requestAnimationFrame(tick);
+        return;
+      }
+
+      const now = ctx.currentTime;
+
+      // Find which sentence is currently playing
+      let currentSentence = -1;
+      let sentenceOffset = 0;
+      for (const [idx, info] of sentenceAudioRef.current.entries()) {
+        if (now >= info.startTime && now < info.startTime + info.duration) {
+          currentSentence = idx;
+          sentenceOffset = now - info.startTime;
+          break;
+        }
+      }
+
+      if (currentSentence >= 0) {
+        const frames = sentenceBlendshapesRef.current.get(currentSentence);
+        if (frames && frames.length > 0) {
+          // Apply real A2F blendshapes synced to audio playback position
+          const fps = 30;
+          const frameIdx = Math.min(Math.floor(sentenceOffset * fps), frames.length - 1);
+          const frame = frames[frameIdx];
+          for (const [arkitKey, weight] of Object.entries(frame.values)) {
+            const morphIdx = resolveBlendshapeIndex(mesh, arkitKey);
+            if (morphIdx >= 0) mesh.morphTargetInfluences[morphIdx] = weight;
+          }
+        } else if (fillerEnabledRef.current.has(currentSentence)) {
+          // Blendshapes haven't arrived yet — play filler idle animation
+          applyFillerAnimation(mesh, performance.now());
+        }
+      }
+
+      blendshapeRafRef.current = requestAnimationFrame(tick);
+    }
+
+    blendshapeRafRef.current = requestAnimationFrame(tick);
+  }
+
+  function stopBlendshapeLoop() {
+    if (blendshapeRafRef.current !== null) {
+      cancelAnimationFrame(blendshapeRafRef.current);
+      blendshapeRafRef.current = null;
+    }
+  }
+
+  /** Clear all per-sentence animation state and cancel the animation loop. */
+  function clearAnimationState() {
+    stopBlendshapeLoop();
+    sentenceBlendshapesRef.current.clear();
+    sentenceAudioRef.current.clear();
+    fillerEnabledRef.current.clear();
+
+    // Reset morph targets to neutral
+    const mesh = morphMeshRef.current;
+    if (mesh?.morphTargetInfluences) {
+      for (let i = 0; i < mesh.morphTargetInfluences.length; i++) {
+        mesh.morphTargetInfluences[i] = 0;
+      }
+    }
+  }
+
   // ── Stop / cleanup ─────────────────────────────────────────────────────────
   const stop = useCallback(() => {
-    if (blendshapeIntervalRef.current) {
-      clearInterval(blendshapeIntervalRef.current);
-      blendshapeIntervalRef.current = null;
-    }
+    clearAnimationState();
     processorRef.current?.disconnect();
     processorRef.current = null;
     micSourceRef.current?.disconnect();
@@ -99,14 +202,6 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
     wsRef.current = null;
     listeningRef.current = false;
     setStatus('idle');
-
-    // Reset morph targets on the mesh
-    const mesh = morphMeshRef.current;
-    if (mesh?.morphTargetInfluences) {
-      for (let i = 0; i < mesh.morphTargetInfluences.length; i++) {
-        mesh.morphTargetInfluences[i] = 0;
-      }
-    }
     morphMeshRef.current = null;
   }, []);
 
@@ -202,18 +297,14 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
               listeningRef.current = false;
               setStatus('responding');
               break;
+
             case 'npc_response': {
-              const { audio } = msg as { audio: string; sentenceIndex: number };
+              const { audio, sentenceIndex } = msg as { audio: string; sentenceIndex: number; type: string };
 
               const ctx = playbackCtxRef.current;
               if (!ctx) {
                 console.error('[Audio] Playback AudioContext is null — cannot play');
                 break;
-              }
-
-              // Record when first sentence audio starts so blendshapes arriving later can sync
-              if (nextStartTimeRef.current === 0) {
-                audioStartMsRef.current = performance.now();
               }
 
               const u8 = Uint8Array.from(atob(audio), c => c.charCodeAt(0));
@@ -226,63 +317,54 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
                   : now + 0.05;
                 nextStartTimeRef.current = startTime + audioBuf.duration;
 
+                // Track audio timing for blendshape sync
+                sentenceAudioRef.current.set(sentenceIndex, {
+                  startTime,
+                  duration: audioBuf.duration,
+                });
+
                 const src = ctx.createBufferSource();
                 src.buffer = audioBuf;
                 src.connect(ctx.destination);
                 src.start(startTime);
 
-                console.log(`[PERF-CLIENT] Sentence scheduled at ${startTime.toFixed(2)}s, duration: ${audioBuf.duration.toFixed(2)}s`);
+                console.log(`[PERF-CLIENT] Sentence ${sentenceIndex} scheduled at ${startTime.toFixed(2)}s, duration: ${audioBuf.duration.toFixed(2)}s`);
+
+                // Start the blendshape animation loop (idempotent — only starts once)
+                startBlendshapeLoop();
               }).catch(err => console.error('[Audio] decodeAudioData failed:', err));
               break;
             }
 
-            case 'npc_blendshapes': {
-              // A2F completed after audio was already sent — sync animation to elapsed playback time
-              const frames = msg.frames as BlendshapeFrame[];
-              const fps = (msg.fps as number) ?? 30;
-              const mesh = morphMeshRef.current;
-              if (!mesh || frames.length === 0) {
-                console.warn('[NpcVoice] npc_blendshapes received but',
-                  !mesh ? 'morph mesh is null' : 'frames array is empty');
-                break;
-              }
-
-              const audioOffsetMs = (msg.audioOffsetMs as number) ?? 0;
-              const elapsedMs = audioOffsetMs > 0
-                ? audioOffsetMs
-                : performance.now() - audioStartMsRef.current;
-              const totalDurationMs = (frames.length / fps) * 1000;
-              // If A2F arrived after the audio already finished, replay from frame 0.
-              // Without this guard startFrameIdx is clamped to frames.length-1 and
-              // the interval fires exactly once — no visible animation.
-              const rawStartIdx = Math.floor(elapsedMs / (1000 / fps));
-              const startFrameIdx = rawStartIdx >= frames.length ? 0
-                : Math.min(rawStartIdx, frames.length - 1);
-              console.log('[NpcVoice] npc_blendshapes — frames:', frames.length,
-                'elapsedMs:', elapsedMs.toFixed(0), 'totalDurationMs:', totalDurationMs.toFixed(0),
-                'startFrame:', startFrameIdx, elapsedMs >= totalDurationMs ? '(replaying from 0)' : '(synced)');
-
-              if (blendshapeIntervalRef.current) clearInterval(blendshapeIntervalRef.current);
-              let frameIdx = startFrameIdx;
-              blendshapeIntervalRef.current = setInterval(() => {
-                if (frameIdx >= frames.length) {
-                  clearInterval(blendshapeIntervalRef.current!);
-                  blendshapeIntervalRef.current = null;
-                  return;
-                }
-                const frame = frames[frameIdx++];
-                if (!mesh.morphTargetInfluences || !mesh.morphTargetDictionary) return;
-                for (const [arkitKey, weight] of Object.entries(frame.values)) {
-                  const idx = resolveBlendshapeIndex(mesh, arkitKey);
-                  if (idx >= 0) mesh.morphTargetInfluences[idx] = weight;
-                }
-              }, 1000 / fps);
+            case 'npc_filler_motion': {
+              const { sentenceIndex } = msg as { sentenceIndex: number; durationMs: number; type: string };
+              // Mark this sentence for filler animation — the animation loop will
+              // play idle motion for it until real blendshapes arrive
+              fillerEnabledRef.current.add(sentenceIndex);
               break;
             }
+
+            case 'npc_sentence_blendshapes': {
+              const { sentenceIndex, frames } = msg as {
+                sentenceIndex: number;
+                frames: BlendshapeFrame[];
+                fps: number;
+                type: string;
+              };
+              // Store per-sentence blendshapes — the animation loop will pick them
+              // up and swap from filler to real frames automatically
+              sentenceBlendshapesRef.current.set(sentenceIndex, frames);
+              // Filler is no longer needed for this sentence
+              fillerEnabledRef.current.delete(sentenceIndex);
+              console.log(`[NpcVoice] Blendshapes received for sentence ${sentenceIndex}: ${frames.length} frames`);
+              break;
+            }
+
             case 'response_end':
               nextStartTimeRef.current = 0;
               listeningRef.current = true;
               setStatus('listening');
+              clearAnimationState();
               break;
             case 'error':
               setErrorMsg(String(msg.message ?? 'Server error'));

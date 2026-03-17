@@ -3,20 +3,22 @@
  *
  * WebSocket endpoint: ws://localhost:3001
  * - Accepts mic PCM audio from browser
- * - Streams audio → Deepgram ASR → OpenAI GPT-4o → ElevenLabs TTS
+ * - Streams audio → Deepgram ASR → OpenAI LLM → ElevenLabs TTS
  * - Simultaneously processes TTS audio through NVIDIA Audio2Face-3D for blendshapes
- * - Returns audio chunks + timestamped ARKit blendshape frames to browser
+ * - Returns audio chunks + per-sentence blendshape frames to browser
  *
  * Message protocol:
  *   Client → Server:
  *     First message:  JSON { type:'init', personalityPrompt, openAiKey, deepgramKey,
- *                                        elevenLabsKey, voiceId, nvidiaApiKey? }
+ *                                        elevenLabsKey, voiceId, nvidiaApiKey?, llmModel? }
  *     Subsequent:     Binary (Int16 PCM, 16kHz, mono)
  *
  *   Server → Client:
  *     JSON:   { type:'transcript', text }
  *     JSON:   { type:'response_start' }
- *     JSON:   { type:'npc_response', audio:string (base64 MP3), blendshapes:Array<{timestamp,values}>, fps:30 }
+ *     JSON:   { type:'npc_response', audio:string (base64 WAV), sentenceIndex, blendshapes:[], fps:30 }
+ *     JSON:   { type:'npc_filler_motion', sentenceIndex, durationMs }
+ *     JSON:   { type:'npc_sentence_blendshapes', sentenceIndex, frames, fps:30 }
  *     JSON:   { type:'response_end' }
  *     JSON:   { type:'error', message }
  */
@@ -57,7 +59,7 @@ function logTime(label: string, startMs: number) {
   console.log(`[PERF] ${label}: ${Date.now() - startMs}ms`);
 }
 
-function extractCompleteSentences(buffer: string): { sentences: string[]; remainder: string } {
+function extractCompleteSentences(buffer: string, firstSentenceSent: boolean): { sentences: string[]; remainder: string } {
   const regex = /[^.!?]*[.!?]+/g;
   const sentences: string[] = [];
   let lastIndex = 0;
@@ -67,10 +69,25 @@ function extractCompleteSentences(buffer: string): { sentences: string[]; remain
     if (s) sentences.push(s);
     lastIndex = regex.lastIndex;
   }
-  return {
-    sentences,
-    remainder: buffer.slice(lastIndex).trim(),
-  };
+  const remainder = buffer.slice(lastIndex).trim();
+
+  // If no sentence-ending punctuation found and first sentence hasn't been sent,
+  // treat comma + 6 or more following words as a flush point to reduce TTFA
+  if (sentences.length === 0 && !firstSentenceSent && remainder) {
+    const commaIdx = remainder.indexOf(',');
+    if (commaIdx >= 0) {
+      const afterComma = remainder.slice(commaIdx + 1).trim();
+      const wordCount = afterComma.split(/\s+/).filter(Boolean).length;
+      if (wordCount >= 6) {
+        return {
+          sentences: [remainder.slice(0, commaIdx + 1).trim()],
+          remainder: afterComma,
+        };
+      }
+    }
+  }
+
+  return { sentences, remainder };
 }
 
 /**
@@ -292,6 +309,7 @@ interface SessionConfig {
   voiceId: string;
   nvidiaApiKey: string;
   nvidiaFunctionId: string;
+  llmModel: string;
 }
 
 wss.on('connection', (ws: WebSocket) => {
@@ -329,27 +347,18 @@ wss.on('connection', (ws: WebSocket) => {
 
       const openai = new OpenAI({ apiKey: config.openAiKey });
 
-      // Open A2F gRPC call before streaming starts so it's ready to receive
-      const { call, framesPromise } = openA2FCall(config.nvidiaApiKey, config.nvidiaFunctionId);
-      call.write({
-        audio_stream_header: {
-          audio_header: { audio_format: 0, channel_count: 1, samples_per_second: 16000, bits_per_sample: 16 },
-        },
-      });
-      logTime('A2F stream opened', t0);
-
       send(ws, { type: 'response_start' });
 
       let sentenceBuffer = '';
       let sentenceIndex = 0;
+      let firstSentenceSent = false;
       let fullResponse = '';
-      const allPcmChunks: Buffer[] = [];
 
       console.log(`[OpenAI] Sending to LLM: "${transcript}"`);
       let llmStream;
       try {
         llmStream = await openai.chat.completions.create({
-          model: 'gpt-4o',
+          model: config.llmModel,
           stream: true,
           messages: [
             { role: 'system', content: config.personalityPrompt },
@@ -364,14 +373,32 @@ wss.on('connection', (ws: WebSocket) => {
       async function processSentence(sentence: string) {
         const idx = sentenceIndex++;
         console.log(`[JIT] Sentence ${idx}: "${sentence}"`);
+
+        // Per-sentence A2F call
+        const { call: a2fCall, framesPromise } = openA2FCall(config!.nvidiaApiKey, config!.nvidiaFunctionId);
+        a2fCall.write({
+          audio_stream_header: {
+            audio_header: { audio_format: 0, channel_count: 1, samples_per_second: 16000, bits_per_sample: 16 },
+          },
+        });
+
         const pcmChunks: Buffer[] = [];
+        let totalPcmBytes = 0;
         for await (const chunk of streamElevenLabsTTS(sentence, config!.voiceId, config!.elevenLabsKey)) {
           pcmChunks.push(chunk);
-          allPcmChunks.push(chunk);
-          call.write({ audio_with_emotion: { audio_buffer: chunk } });
+          totalPcmBytes += chunk.length;
+          a2fCall.write({ audio_with_emotion: { audio_buffer: chunk } });
         }
+
+        // End this sentence's A2F stream immediately
+        a2fCall.end();
+
         const wavBuffer = pcmToWav(Buffer.concat(pcmChunks));
         console.log(`[JIT] Sentence ${idx} WAV ready: ${wavBuffer.length} bytes`);
+
+        const estimatedDurationMs = (totalPcmBytes / (16000 * 2)) * 1000;
+
+        // Send audio to client
         send(ws, {
           type: 'npc_response',
           audio: wavBuffer.toString('base64'),
@@ -379,6 +406,23 @@ wss.on('connection', (ws: WebSocket) => {
           blendshapes: [],
           fps: 30,
         });
+
+        if (idx === 0) logTime('First audio sent', t0);
+
+        // Send filler motion so client can play idle animation while A2F processes
+        send(ws, {
+          type: 'npc_filler_motion',
+          sentenceIndex: idx,
+          durationMs: estimatedDurationMs,
+        });
+
+        // When A2F resolves for this sentence, send blendshapes immediately
+        framesPromise.then((frames) => {
+          if (idx === 0) logTime('First A2F blendshapes ready', t0);
+          if (frames.length > 0) {
+            send(ws, { type: 'npc_sentence_blendshapes', sentenceIndex: idx, frames, fps: 30 });
+          }
+        }).catch(() => { /* logged inside openA2FCall */ });
       }
 
       const sentencePromises: Promise<void>[] = [];
@@ -387,8 +431,9 @@ wss.on('connection', (ws: WebSocket) => {
         const token = chunk.choices[0]?.delta?.content ?? '';
         fullResponse += token;
         sentenceBuffer += token;
-        const { sentences, remainder } = extractCompleteSentences(sentenceBuffer);
+        const { sentences, remainder } = extractCompleteSentences(sentenceBuffer, firstSentenceSent);
         if (sentences.length > 0) {
+          firstSentenceSent = true;
           sentenceBuffer = remainder;
           for (const sentence of sentences) {
             const prev = sentencePromises[sentencePromises.length - 1] ?? Promise.resolve();
@@ -408,20 +453,10 @@ wss.on('connection', (ws: WebSocket) => {
       }
 
       await Promise.all(sentencePromises);
-      call.end();
 
-      console.log(`[JIT] All sentences sent, total PCM: ${allPcmChunks.length} chunks`);
+      console.log(`[JIT] All sentences sent`);
       incomingAudioChunks.length = 0;
       send(ws, { type: 'response_end' });
-
-      // A2F continues processing in background — send blendshapes when done
-      const audioSentAt = Date.now();
-      framesPromise.then((frames) => {
-        logTime('A2F blendshapes ready', t0);
-        if (frames.length > 0) {
-          send(ws, { type: 'npc_blendshapes', frames, fps: 30, audioOffsetMs: Date.now() - audioSentAt });
-        }
-      }).catch(() => { /* logged inside openA2FCall */ });
     } catch (err: unknown) {
       console.error('[Session] Pipeline error:', err instanceof Error ? err.stack ?? err.message : err);
       send(ws, { type: 'error', message: err instanceof Error ? err.message : 'Response error' });
@@ -446,24 +481,15 @@ wss.on('connection', (ws: WebSocket) => {
     const greetingPrompt = 'Start the conversation by greeting the player and asking them one short question. Speak in character.';
 
     try {
-      // Open A2F gRPC call before streaming starts so it's ready to receive
-      const { call, framesPromise } = openA2FCall(config.nvidiaApiKey, config.nvidiaFunctionId);
-      call.write({
-        audio_stream_header: {
-          audio_header: { audio_format: 0, channel_count: 1, samples_per_second: 16000, bits_per_sample: 16 },
-        },
-      });
-      logTime('A2F stream opened', t0);
-
       send(ws, { type: 'response_start' });
 
       let sentenceBuffer = '';
       let sentenceIndex = 0;
+      let firstSentenceSent = false;
       let fullResponse = '';
-      const allPcmChunks: Buffer[] = [];
 
       const llmStream = await openai.chat.completions.create({
-        model: 'gpt-4o',
+        model: config.llmModel,
         stream: true,
         messages: [
           { role: 'system', content: system },
@@ -474,14 +500,32 @@ wss.on('connection', (ws: WebSocket) => {
       async function processSentence(sentence: string) {
         const idx = sentenceIndex++;
         console.log(`[JIT] Sentence ${idx}: "${sentence}"`);
+
+        // Per-sentence A2F call
+        const { call: a2fCall, framesPromise } = openA2FCall(config!.nvidiaApiKey, config!.nvidiaFunctionId);
+        a2fCall.write({
+          audio_stream_header: {
+            audio_header: { audio_format: 0, channel_count: 1, samples_per_second: 16000, bits_per_sample: 16 },
+          },
+        });
+
         const pcmChunks: Buffer[] = [];
+        let totalPcmBytes = 0;
         for await (const chunk of streamElevenLabsTTS(sentence, config!.voiceId, config!.elevenLabsKey)) {
           pcmChunks.push(chunk);
-          allPcmChunks.push(chunk);
-          call.write({ audio_with_emotion: { audio_buffer: chunk } });
+          totalPcmBytes += chunk.length;
+          a2fCall.write({ audio_with_emotion: { audio_buffer: chunk } });
         }
+
+        // End this sentence's A2F stream immediately
+        a2fCall.end();
+
         const wavBuffer = pcmToWav(Buffer.concat(pcmChunks));
         console.log(`[JIT] Sentence ${idx} WAV ready: ${wavBuffer.length} bytes`);
+
+        const estimatedDurationMs = (totalPcmBytes / (16000 * 2)) * 1000;
+
+        // Send audio to client
         send(ws, {
           type: 'npc_response',
           audio: wavBuffer.toString('base64'),
@@ -489,6 +533,23 @@ wss.on('connection', (ws: WebSocket) => {
           blendshapes: [],
           fps: 30,
         });
+
+        if (idx === 0) logTime('First audio sent', t0);
+
+        // Send filler motion so client can play idle animation while A2F processes
+        send(ws, {
+          type: 'npc_filler_motion',
+          sentenceIndex: idx,
+          durationMs: estimatedDurationMs,
+        });
+
+        // When A2F resolves for this sentence, send blendshapes immediately
+        framesPromise.then((frames) => {
+          if (idx === 0) logTime('First A2F blendshapes ready', t0);
+          if (frames.length > 0) {
+            send(ws, { type: 'npc_sentence_blendshapes', sentenceIndex: idx, frames, fps: 30 });
+          }
+        }).catch(() => { /* logged inside openA2FCall */ });
       }
 
       const sentencePromises: Promise<void>[] = [];
@@ -497,8 +558,9 @@ wss.on('connection', (ws: WebSocket) => {
         const token = chunk.choices[0]?.delta?.content ?? '';
         fullResponse += token;
         sentenceBuffer += token;
-        const { sentences, remainder } = extractCompleteSentences(sentenceBuffer);
+        const { sentences, remainder } = extractCompleteSentences(sentenceBuffer, firstSentenceSent);
         if (sentences.length > 0) {
+          firstSentenceSent = true;
           sentenceBuffer = remainder;
           for (const sentence of sentences) {
             const prev = sentencePromises[sentencePromises.length - 1] ?? Promise.resolve();
@@ -518,19 +580,9 @@ wss.on('connection', (ws: WebSocket) => {
       }
 
       await Promise.all(sentencePromises);
-      call.end();
 
-      console.log(`[JIT] All sentences sent, total PCM: ${allPcmChunks.length} chunks`);
+      console.log(`[JIT] All sentences sent`);
       send(ws, { type: 'response_end' });
-
-      // A2F continues processing in background — send blendshapes when done
-      const audioSentAt = Date.now();
-      framesPromise.then((frames) => {
-        logTime('A2F blendshapes ready', t0);
-        if (frames.length > 0) {
-          send(ws, { type: 'npc_blendshapes', frames, fps: 30, audioOffsetMs: Date.now() - audioSentAt });
-        }
-      }).catch(() => { /* logged inside openA2FCall */ });
     } catch (err: unknown) {
       console.error('[startConversation] Error:', err instanceof Error ? err.message : err);
       send(ws, { type: 'error', message: err instanceof Error ? err.message : 'Greeting error' });
@@ -558,7 +610,8 @@ wss.on('connection', (ws: WebSocket) => {
       smart_format: true,
       punctuate: true,
       interim_results: true,
-      endpointing: 200,
+      endpointing: 100,
+      utterance_end_ms: 1000,
       no_delay: true,
       vad_events: true,
       encoding: 'linear16',
@@ -626,7 +679,7 @@ wss.on('connection', (ws: WebSocket) => {
     if (!config) {
       // First message must be the init JSON
       try {
-        const msg = JSON.parse(data.toString()) as { type?: string } & Partial<SessionConfig>;
+        const msg = JSON.parse(data.toString()) as { type?: string; llmModel?: string } & Partial<SessionConfig>;
         if (msg.type !== 'init') {
           send(ws, { type: 'error', message: 'First message must be type:init' });
           return;
@@ -643,11 +696,12 @@ wss.on('connection', (ws: WebSocket) => {
           voiceId: msg.voiceId,
           nvidiaApiKey: msg.nvidiaApiKey ?? '',
           nvidiaFunctionId: msg.nvidiaFunctionId ?? '',
+          llmModel: msg.llmModel ?? 'gpt-4o-mini',
         };
         try {
           initDeepgram();
           send(ws, { type: 'ready' });
-          console.log('[WS] Session initialized');
+          console.log(`[WS] Session initialized (llmModel: ${config.llmModel})`);
           startConversation();
         } catch (err: unknown) {
           send(ws, { type: 'error', message: `ASR init failed: ${err instanceof Error ? err.message : String(err)}` });
