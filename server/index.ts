@@ -117,7 +117,7 @@ async function* streamElevenLabsTTS(
     ws.send(JSON.stringify({
       text: ' ',
       voice_settings: { stability: 0.5, similarity_boost: 0.75 },
-      generation_config: { chunk_length_schedule: [120, 160, 250, 290] },
+      generation_config: { chunk_length_schedule: [50, 100, 150, 200] },
     }));
     // Send the actual text
     ws.send(JSON.stringify({ text }));
@@ -371,6 +371,7 @@ wss.on('connection', (ws: WebSocket) => {
       }
 
       async function processSentence(sentence: string) {
+        console.log(`[JIT] processSentence ${sentenceIndex} called at: ${Date.now() - t0}ms`);
         const idx = sentenceIndex++;
         console.log(`[JIT] Sentence ${idx}: "${sentence}"`);
 
@@ -494,6 +495,7 @@ wss.on('connection', (ws: WebSocket) => {
       });
 
       async function processSentence(sentence: string) {
+        console.log(`[JIT] processSentence ${sentenceIndex} called at: ${Date.now() - t0}ms`);
         const idx = sentenceIndex++;
         console.log(`[JIT] Sentence ${idx}: "${sentence}"`);
 
