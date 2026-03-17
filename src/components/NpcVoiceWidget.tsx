@@ -106,6 +106,10 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
   const morphMeshRef = useRef<THREE.Mesh | null>(null);
   const nextStartTimeRef = useRef<number>(0);
 
+  // Audio queue for sequential playback of npc_response messages
+  const audioQueueRef = useRef<Array<{ audio: string; sentenceIndex: number }>>([]);
+  const isPlayingAudioRef = useRef(false);
+
   // Per-sentence blendshape state
   const sentenceBlendshapesRef = useRef<Map<number, BlendshapeFrame[]>>(new Map());
   const sentenceAudioRef = useRef<Map<number, { startTime: number; duration: number }>>(new Map());
@@ -183,6 +187,63 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
         mesh.morphTargetInfluences[i] = 0;
       }
     }
+  }
+
+  // ── Audio queue playback ───────────────────────────────────────────────────
+  function playNextInQueue() {
+    if (isPlayingAudioRef.current) return;
+    const next = audioQueueRef.current.shift();
+    if (!next) return;
+
+    isPlayingAudioRef.current = true;
+    const { audio, sentenceIndex } = next;
+
+    const ctx = playbackCtxRef.current;
+    if (!ctx) {
+      console.error('[Audio] Playback AudioContext is null — cannot play');
+      isPlayingAudioRef.current = false;
+      return;
+    }
+
+    const u8 = Uint8Array.from(atob(audio), c => c.charCodeAt(0));
+    const arrayBuf = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+
+    ctx.decodeAudioData(arrayBuf as ArrayBuffer).then(audioBuf => {
+      const startTime = ctx.currentTime + 0.05;
+
+      // Track audio timing for blendshape sync
+      sentenceAudioRef.current.set(sentenceIndex, {
+        startTime,
+        duration: audioBuf.duration,
+      });
+
+      const src = ctx.createBufferSource();
+      src.buffer = audioBuf;
+      src.connect(ctx.destination);
+      src.start(startTime);
+
+      console.log(`[PERF-CLIENT] Sentence ${sentenceIndex} playing at ${startTime.toFixed(2)}s, duration: ${audioBuf.duration.toFixed(2)}s`);
+
+      // Start the blendshape animation loop (idempotent — only starts once)
+      startBlendshapeLoop();
+
+      src.onended = () => {
+        isPlayingAudioRef.current = false;
+        if (audioQueueRef.current.length > 0) {
+          playNextInQueue();
+        } else {
+          // Full queue drained — notify server
+          const ws = wsRef.current;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'playback_complete' }));
+          }
+        }
+      };
+    }).catch(err => {
+      console.error('[Audio] decodeAudioData failed:', err);
+      isPlayingAudioRef.current = false;
+      playNextInQueue();
+    });
   }
 
   // ── Stop / cleanup ─────────────────────────────────────────────────────────
@@ -296,43 +357,15 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
             case 'response_start':
               listeningRef.current = false;
               setStatus('responding');
+              // Clear queue for new response
+              audioQueueRef.current = [];
+              isPlayingAudioRef.current = false;
               break;
 
             case 'npc_response': {
               const { audio, sentenceIndex } = msg as { audio: string; sentenceIndex: number; type: string };
-
-              const ctx = playbackCtxRef.current;
-              if (!ctx) {
-                console.error('[Audio] Playback AudioContext is null — cannot play');
-                break;
-              }
-
-              const u8 = Uint8Array.from(atob(audio), c => c.charCodeAt(0));
-              const arrayBuf = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
-
-              ctx.decodeAudioData(arrayBuf as ArrayBuffer).then(audioBuf => {
-                const now = ctx.currentTime;
-                const startTime = nextStartTimeRef.current > now + 0.05
-                  ? nextStartTimeRef.current
-                  : now + 0.05;
-                nextStartTimeRef.current = startTime + audioBuf.duration;
-
-                // Track audio timing for blendshape sync
-                sentenceAudioRef.current.set(sentenceIndex, {
-                  startTime,
-                  duration: audioBuf.duration,
-                });
-
-                const src = ctx.createBufferSource();
-                src.buffer = audioBuf;
-                src.connect(ctx.destination);
-                src.start(startTime);
-
-                console.log(`[PERF-CLIENT] Sentence ${sentenceIndex} scheduled at ${startTime.toFixed(2)}s, duration: ${audioBuf.duration.toFixed(2)}s`);
-
-                // Start the blendshape animation loop (idempotent — only starts once)
-                startBlendshapeLoop();
-              }).catch(err => console.error('[Audio] decodeAudioData failed:', err));
+              audioQueueRef.current.push({ audio, sentenceIndex });
+              playNextInQueue();
               break;
             }
 
@@ -361,7 +394,6 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
             }
 
             case 'response_end':
-              nextStartTimeRef.current = 0;
               listeningRef.current = true;
               setStatus('listening');
               clearAnimationState();

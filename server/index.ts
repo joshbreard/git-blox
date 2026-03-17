@@ -329,7 +329,6 @@ wss.on('connection', (ws: WebSocket) => {
   let lastAudioReceivedMs = 0;
   let firstSegmentMs = 0;
   let lastSegmentConfidence = 0;
-  const sentenceCompleteCallbacks = new Map<number, () => void>();
 
   async function handleTranscript(transcript: string) {
     if (isSpeaking) return;
@@ -411,11 +410,6 @@ wss.on('connection', (ws: WebSocket) => {
           type: 'npc_filler_motion',
           sentenceIndex: idx,
           durationMs: Math.round((wavBuffer.length / (16000 * 2)) * 1000),
-        });
-
-        // Wait for client to confirm this sentence finished playing
-        await new Promise<void>((resolve) => {
-          sentenceCompleteCallbacks.set(idx, resolve);
         });
 
         // When A2F resolves for this sentence, send blendshapes immediately
@@ -539,11 +533,6 @@ wss.on('connection', (ws: WebSocket) => {
           type: 'npc_filler_motion',
           sentenceIndex: idx,
           durationMs: Math.round((wavBuffer.length / (16000 * 2)) * 1000),
-        });
-
-        // Wait for client to confirm this sentence finished playing
-        await new Promise<void>((resolve) => {
-          sentenceCompleteCallbacks.set(idx, resolve);
         });
 
         // When A2F resolves for this sentence, send blendshapes immediately
@@ -717,16 +706,7 @@ wss.on('connection', (ws: WebSocket) => {
 
     // Handle JSON control messages from client
     if (!isBinary) {
-      try {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === 'sentence_complete' && typeof msg.sentenceIndex === 'number') {
-          const cb = sentenceCompleteCallbacks.get(msg.sentenceIndex);
-          if (cb) {
-            cb();
-            sentenceCompleteCallbacks.delete(msg.sentenceIndex);
-          }
-        }
-      } catch { /* ignore parse errors */ }
+      // Currently no client→server control messages needed
       return;
     }
 
