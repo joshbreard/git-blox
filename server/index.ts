@@ -329,6 +329,7 @@ wss.on('connection', (ws: WebSocket) => {
   let lastAudioReceivedMs = 0;
   let firstSegmentMs = 0;
   let lastSegmentConfidence = 0;
+  const sentenceCompleteCallbacks = new Map<number, () => void>();
 
   async function handleTranscript(transcript: string) {
     if (isSpeaking) return;
@@ -383,20 +384,16 @@ wss.on('connection', (ws: WebSocket) => {
         });
 
         const pcmChunks: Buffer[] = [];
-        let totalPcmBytes = 0;
         for await (const chunk of streamElevenLabsTTS(sentence, config!.voiceId, config!.elevenLabsKey)) {
           pcmChunks.push(chunk);
-          totalPcmBytes += chunk.length;
           a2fCall.write({ audio_with_emotion: { audio_buffer: chunk } });
         }
 
-        // End this sentence's A2F stream immediately
+        await new Promise(r => setTimeout(r, 50));
         a2fCall.end();
 
         const wavBuffer = pcmToWav(Buffer.concat(pcmChunks));
         console.log(`[JIT] Sentence ${idx} WAV ready: ${wavBuffer.length} bytes`);
-
-        const estimatedDurationMs = (totalPcmBytes / (16000 * 2)) * 1000;
 
         // Send audio to client
         send(ws, {
@@ -413,7 +410,12 @@ wss.on('connection', (ws: WebSocket) => {
         send(ws, {
           type: 'npc_filler_motion',
           sentenceIndex: idx,
-          durationMs: estimatedDurationMs,
+          durationMs: Math.round((wavBuffer.length / (16000 * 2)) * 1000),
+        });
+
+        // Wait for client to confirm this sentence finished playing
+        await new Promise<void>((resolve) => {
+          sentenceCompleteCallbacks.set(idx, resolve);
         });
 
         // When A2F resolves for this sentence, send blendshapes immediately
@@ -510,20 +512,16 @@ wss.on('connection', (ws: WebSocket) => {
         });
 
         const pcmChunks: Buffer[] = [];
-        let totalPcmBytes = 0;
         for await (const chunk of streamElevenLabsTTS(sentence, config!.voiceId, config!.elevenLabsKey)) {
           pcmChunks.push(chunk);
-          totalPcmBytes += chunk.length;
           a2fCall.write({ audio_with_emotion: { audio_buffer: chunk } });
         }
 
-        // End this sentence's A2F stream immediately
+        await new Promise(r => setTimeout(r, 50));
         a2fCall.end();
 
         const wavBuffer = pcmToWav(Buffer.concat(pcmChunks));
         console.log(`[JIT] Sentence ${idx} WAV ready: ${wavBuffer.length} bytes`);
-
-        const estimatedDurationMs = (totalPcmBytes / (16000 * 2)) * 1000;
 
         // Send audio to client
         send(ws, {
@@ -540,7 +538,12 @@ wss.on('connection', (ws: WebSocket) => {
         send(ws, {
           type: 'npc_filler_motion',
           sentenceIndex: idx,
-          durationMs: estimatedDurationMs,
+          durationMs: Math.round((wavBuffer.length / (16000 * 2)) * 1000),
+        });
+
+        // Wait for client to confirm this sentence finished playing
+        await new Promise<void>((resolve) => {
+          sentenceCompleteCallbacks.set(idx, resolve);
         });
 
         // When A2F resolves for this sentence, send blendshapes immediately
@@ -709,6 +712,21 @@ wss.on('connection', (ws: WebSocket) => {
       } catch {
         send(ws, { type: 'error', message: 'Invalid init message' });
       }
+      return;
+    }
+
+    // Handle JSON control messages from client
+    if (!isBinary) {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'sentence_complete' && typeof msg.sentenceIndex === 'number') {
+          const cb = sentenceCompleteCallbacks.get(msg.sentenceIndex);
+          if (cb) {
+            cb();
+            sentenceCompleteCallbacks.delete(msg.sentenceIndex);
+          }
+        }
+      } catch { /* ignore parse errors */ }
       return;
     }
 
