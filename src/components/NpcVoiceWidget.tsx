@@ -104,6 +104,8 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
   const listeningRef = useRef<boolean>(false);
 
   const morphMeshRef = useRef<THREE.Mesh | null>(null);
+  const hasLoggedMeshRef = useRef(false);
+  const hasLoggedFrameApplyRef = useRef(false);
   // Audio queue for sequential playback of npc_response messages
   const audioQueueRef = useRef<Array<{ audio: string; sentenceIndex: number }>>([]);
   const isPlayingAudioRef = useRef(false);
@@ -113,6 +115,8 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
   const sentenceAudioRef = useRef<Map<number, { startTime: number; duration: number }>>(new Map());
   const fillerEnabledRef = useRef<Set<number>>(new Set());
   const blendshapeRafRef = useRef<number | null>(null);
+  const a2fTransitionRef = useRef<Map<number, number>>(new Map());
+  const lastTickTimeRef = useRef<number | null>(null);
 
   const isActive = status !== 'idle' && status !== 'error';
 
@@ -121,6 +125,15 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
     if (blendshapeRafRef.current !== null) return; // already running
 
     function tick() {
+      if (!hasLoggedMeshRef.current) {
+        hasLoggedMeshRef.current = true;
+        console.log('[A2F-DEBUG] tick — morphMeshRef:', morphMeshRef.current ? 'FOUND' : 'NULL');
+        if (morphMeshRef.current) {
+          console.log('[A2F-DEBUG] morphTargetDictionary keys:', Object.keys(morphMeshRef.current.morphTargetDictionary ?? {}));
+          console.log('[A2F-DEBUG] morphTargetInfluences length:', morphMeshRef.current.morphTargetInfluences?.length);
+        }
+      }
+
       const ctx = playbackCtxRef.current;
       const mesh = morphMeshRef.current;
       if (!ctx || !mesh?.morphTargetInfluences) {
@@ -141,19 +154,42 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
         }
       }
 
+      // Compute deltaTime for transition blending
+      const perfNow = performance.now() / 1000;
+      const deltaTime = perfNow - (lastTickTimeRef.current ?? perfNow);
+      lastTickTimeRef.current = perfNow;
+
       if (currentSentence >= 0) {
         const frames = sentenceBlendshapesRef.current.get(currentSentence);
         if (frames && frames.length > 0) {
+          // Ramp blend weight from 0→1 over ~300ms when A2F frames first arrive
+          let blend = a2fTransitionRef.current.get(currentSentence) ?? 0;
+          blend = Math.min(blend + deltaTime / 0.3, 1.0);
+          a2fTransitionRef.current.set(currentSentence, blend);
+
           // Apply real A2F blendshapes synced to audio playback position
           const fps = 30;
           const frameIdx = Math.min(Math.floor(sentenceOffset * fps), frames.length - 1);
+          if (!hasLoggedFrameApplyRef.current) {
+            hasLoggedFrameApplyRef.current = true;
+            console.log('[A2F-DEBUG] Applying frame', frameIdx, '— keys in frame:', Object.keys(frames[frameIdx]?.values ?? {}).slice(0, 5));
+          }
+
+          // Apply filler first so morphTargetInfluences hold filler values
+          applyFillerAnimation(mesh, performance.now());
+
+          // Lerp each A2F target over the filler values
           const frame = frames[frameIdx];
           for (const [arkitKey, weight] of Object.entries(frame.values)) {
             const morphIdx = resolveBlendshapeIndex(mesh, arkitKey);
-            if (morphIdx >= 0) mesh.morphTargetInfluences[morphIdx] = weight;
+            if (morphIdx >= 0) {
+              const currentVal = mesh.morphTargetInfluences[morphIdx];
+              mesh.morphTargetInfluences[morphIdx] = currentVal + (weight - currentVal) * blend;
+            }
           }
-        } else if (fillerEnabledRef.current.has(currentSentence)) {
-          // Blendshapes haven't arrived yet — play filler idle animation
+        } else {
+          // No A2F frames for this sentence — play filler idle animation as
+          // a fallback so the mouth still does idle movement instead of freezing
           applyFillerAnimation(mesh, performance.now());
         }
       }
@@ -177,6 +213,8 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
     sentenceBlendshapesRef.current.clear();
     sentenceAudioRef.current.clear();
     fillerEnabledRef.current.clear();
+    a2fTransitionRef.current.clear();
+    lastTickTimeRef.current = null;
 
     // Reset morph targets to neutral
     const mesh = morphMeshRef.current;
@@ -381,12 +419,19 @@ export default function NpcVoiceWidget({ objectId }: { objectId: string }) {
                 fps: number;
                 type: string;
               };
+              // Skip sentence 0 — its frames arrive too late to sync; let it play
+              // with filler/idle animation instead, which looks natural as an intro.
+              if (sentenceIndex === 0) break;
               // Store per-sentence blendshapes — the animation loop will pick them
               // up and swap from filler to real frames automatically
               sentenceBlendshapesRef.current.set(sentenceIndex, frames);
               // Filler is no longer needed for this sentence
               fillerEnabledRef.current.delete(sentenceIndex);
               console.log(`[NpcVoice] Blendshapes received for sentence ${sentenceIndex}: ${frames.length} frames`);
+              console.log('[A2F-DEBUG] Frames stored for sentence', sentenceIndex, '— frame count:', frames.length);
+              if (frames.length > 0) {
+                console.log('[A2F-DEBUG] Sample blendshape keys:', Object.keys(frames[0].values).slice(0, 5));
+              }
               break;
             }
 

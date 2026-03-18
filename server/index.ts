@@ -399,13 +399,17 @@ wss.on('connection', (ws: WebSocket) => {
         const pcmChunks: Buffer[] = [];
         for await (const chunk of streamElevenLabsTTS(sentence, config!.voiceId, config!.elevenLabsKey)) {
           pcmChunks.push(chunk);
-          a2fCall.write({ audio_with_emotion: { audio_buffer: chunk } });
         }
 
+        // Send full WAV to A2F (A2F requires WAV format, not raw PCM chunks)
+        const fullPcm = Buffer.concat(pcmChunks);
+        const wavForA2F = pcmToWav(fullPcm);
+        a2fCall.write({ audio_with_emotion: { audio_buffer: wavForA2F } });
         await new Promise(r => setTimeout(r, 50));
         a2fCall.end();
 
-        const wavBuffer = pcmToWav(Buffer.concat(pcmChunks));
+        // Build WAV for browser playback separately
+        const wavBuffer = pcmToWav(fullPcm);
         console.log(`[JIT] Sentence ${idx} WAV ready: ${wavBuffer.length} bytes`);
 
         // Send audio to client
@@ -523,13 +527,17 @@ wss.on('connection', (ws: WebSocket) => {
         const pcmChunks: Buffer[] = [];
         for await (const chunk of streamElevenLabsTTS(sentence, config!.voiceId, config!.elevenLabsKey)) {
           pcmChunks.push(chunk);
-          a2fCall.write({ audio_with_emotion: { audio_buffer: chunk } });
         }
 
+        // Send full WAV to A2F (A2F requires WAV format, not raw PCM chunks)
+        const fullPcm = Buffer.concat(pcmChunks);
+        const wavForA2F = pcmToWav(fullPcm);
+        a2fCall.write({ audio_with_emotion: { audio_buffer: wavForA2F } });
         await new Promise(r => setTimeout(r, 50));
         a2fCall.end();
 
-        const wavBuffer = pcmToWav(Buffer.concat(pcmChunks));
+        // Build WAV for browser playback separately
+        const wavBuffer = pcmToWav(fullPcm);
         console.log(`[JIT] Sentence ${idx} WAV ready: ${wavBuffer.length} bytes`);
 
         // Send audio to client
